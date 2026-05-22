@@ -20,6 +20,8 @@ pub enum Error {
     EntryNotFound(String),
     #[error("invalid: {0}")]
     Invalid(String),
+    #[error("entry already exists: {0}")]
+    AlreadyExists(String),
 }
 
 impl From<CoreError> for Error {
