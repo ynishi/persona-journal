@@ -18,7 +18,9 @@ use crate::db::{Db, EntryMetaRow};
 use crate::error::{Error, Result};
 use crate::projection::{render_root_index, write_root_index};
 use crate::schema::{KindConfig, KindMode};
-use crate::storage::{entry_id, extract_first_line, flat_path, versioned_path, write_file};
+use crate::storage::{
+    extract_first_line, flat_path, seq_in_kind_str, uname as make_uname, versioned_path, write_file,
+};
 
 pub(crate) mod db_cache {
     use super::*;
@@ -101,7 +103,10 @@ pub(crate) mod loaded_cache {
 
 #[derive(Debug, Clone)]
 pub struct EntryRow {
+    /// Entry identifier in uname format: `{kind}/{ym}_{seq:06}` (e.g. `"emo/2024-08_000001"`).
+    /// CRUX-3: this field carries the uname; UUID is never exposed externally.
     pub id: String,
+    pub uname: String,
     pub kind: String,
     pub created_at: String,
     pub updated_at: String,
@@ -114,7 +119,10 @@ pub struct EntryRow {
 impl From<EntryMetaRow> for EntryRow {
     fn from(r: EntryMetaRow) -> Self {
         Self {
-            id: r.id,
+            // CRUX-3: public API exposes uname, not UUID.
+            // id field carries uname for external consumers.
+            id: r.uname.clone(),
+            uname: r.uname,
             kind: r.kind,
             created_at: r.created_at,
             updated_at: r.updated_at,
@@ -467,22 +475,24 @@ impl Journal {
             .map_err(|e| Error::Invalid(e.to_string()))?;
         let ym = format!("{:04}-{:02}", now.year(), u8::from(now.month()));
         let seq = db.next_seq(kind, &ym)?;
-        let id = entry_id(now.year(), u8::from(now.month()) as u32, seq);
+        let seq_in_kind = seq_in_kind_str(&ym, seq);
+        let entry_uname = make_uname(kind, &seq_in_kind);
 
         let first_line = extract_first_line(text);
 
         let path = if kind_cfg.versioning {
-            versioned_path(&self.root, persona, kind, &id, 1)
+            versioned_path(&self.root, persona, kind, &seq_in_kind, 1)
         } else {
-            flat_path(&self.root, persona, kind, &id)
+            flat_path(&self.root, persona, kind, &seq_in_kind)
         };
         let rel = path
             .strip_prefix(&self.root)
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| path.to_string_lossy().into_owned());
         db.say_atomic(
-            &id,
+            &entry_uname,
             kind,
+            &seq_in_kind,
             &now_iso,
             first_line.as_deref(),
             &tags,
@@ -500,94 +510,7 @@ impl Journal {
             self.project_index_best_effort(&db, persona, &now_iso);
         }
 
-        Ok(id)
-    }
-
-    /// Import a legacy FS entry into the DB with caller-supplied `(year, month, seq)`
-    /// and `created_at`.
-    ///
-    /// Unlike [`Journal::say`], which auto-assigns timestamp and seq via
-    /// `now_utc()` + `next_seq()`, this API preserves the original FS-derived
-    /// identity for migration use. Entries mode only (matches `say` MVP scope).
-    ///
-    /// # Behavior
-    /// - id = `entry_id(year, month, seq)` (e.g. `"2024-08_00012"`)
-    /// - If no existing row: inserts as version 1 (same path as `say`).
-    /// - If existing row and `force_override == false`: returns
-    ///   `Err(Error::AlreadyExists(id))` without writing.
-    /// - If existing row and `force_override == true`: appends a new version
-    ///   (`current_version + 1`) with the supplied body, updating `updated_at`.
-    /// - FS projection is best-effort (matches `say`).
-    #[allow(clippy::too_many_arguments)]
-    pub fn import_entry(
-        &self,
-        persona: &str,
-        kind: &str,
-        year: i32,
-        month: u8,
-        seq: u32,
-        created_at: &str,
-        body: &str,
-        tags: Vec<String>,
-        force_override: bool,
-    ) -> Result<String> {
-        let db_arc = self.open_db(persona)?;
-        let db = db_arc
-            .lock()
-            .map_err(|e| Error::Invalid(format!("db lock poisoned: {e}")))?;
-        let kind_cfg = db
-            .get_kind(kind)?
-            .ok_or_else(|| Error::UnknownKind(kind.to_string()))?;
-        if !matches!(kind_cfg.mode, KindMode::Entries) {
-            return Err(Error::Invalid(
-                "import_entry() supports entries mode only".to_string(),
-            ));
-        }
-
-        let id = entry_id(year, month as u32, seq);
-        let first_line = extract_first_line(body);
-        let existing = db.get_entry(&id)?;
-
-        let (version, _is_new) = match existing {
-            None => (1u32, true),
-            Some(_) if !force_override => {
-                return Err(Error::AlreadyExists(id));
-            }
-            Some(row) => (row.current_version + 1, false),
-        };
-
-        let path = if kind_cfg.versioning {
-            versioned_path(&self.root, persona, kind, &id, version)
-        } else {
-            flat_path(&self.root, persona, kind, &id)
-        };
-        let rel = path
-            .strip_prefix(&self.root)
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| path.to_string_lossy().into_owned());
-
-        if version == 1 {
-            db.say_atomic(
-                &id,
-                kind,
-                created_at,
-                first_line.as_deref(),
-                &tags,
-                1,
-                &rel,
-                body,
-            )?;
-        } else {
-            db.add_version(&id, version, body, &rel, created_at)?;
-        }
-
-        // Best-effort FS projection (matches `say`).
-        self.project_entry_file_best_effort(&path, body);
-        if kind_cfg.indexed {
-            self.project_index_best_effort(&db, persona, created_at);
-        }
-
-        Ok(id)
+        Ok(entry_uname)
     }
 
     /// Single implementation of "render and write `_index.md` for one persona".
@@ -837,7 +760,7 @@ impl Journal {
             let _ = writeln!(
                 out,
                 "| {} | {} | {} | {} | {} |",
-                row.created_at, row.kind, row.id, row.retrieval_strength, body_head
+                row.created_at, row.kind, row.uname, row.retrieval_strength, body_head
             );
         }
         Ok(out)
@@ -866,10 +789,10 @@ impl Journal {
             .lock()
             .map_err(|e| Error::Invalid(format!("db lock poisoned: {e}")))?;
         let meta = db
-            .get_entry(id)?
+            .get_entry_by_uname(id)?
             .ok_or_else(|| Error::EntryNotFound(id.to_string()))?;
         let v = version.unwrap_or(meta.current_version);
-        db.version_body(id, v)?
+        db.version_body(&meta.id, v)?
             .ok_or_else(|| Error::EntryNotFound(format!("{}@v{}", id, v)))
     }
 
@@ -877,7 +800,7 @@ impl Journal {
     ///
     /// # Arguments
     /// - `persona`: persona id (matches persona-pack id)
-    /// - `entry_id`: entry identifier (text id, e.g. `"2024-01_00001"`)
+    /// - `entry_id`: uname, e.g. `"emo/2024-01_000001"`
     /// - `value`: new retrieval strength; must be in `[0.0, 1.0]` and not NaN
     ///
     /// # Returns
@@ -902,14 +825,17 @@ impl Journal {
         let db = db_arc
             .lock()
             .map_err(|e| Error::Invalid(format!("db lock poisoned: {e}")))?;
-        db.set_retrieval_strength(entry_id, value)
+        let meta = db
+            .get_entry_by_uname(entry_id)?
+            .ok_or_else(|| Error::EntryNotFound(entry_id.to_string()))?;
+        db.set_retrieval_strength(&meta.id, value)
     }
 
     /// Get the `retrieval_strength` for the given entry.
     ///
     /// # Arguments
     /// - `persona`: persona id (matches persona-pack id)
-    /// - `entry_id`: entry identifier (text id, e.g. `"2024-01_00001"`)
+    /// - `entry_id`: entry identifier (uname, e.g. `"emo/2024-01_000001"`)
     ///
     /// # Returns
     /// `Ok(value)` with the current retrieval strength.
@@ -922,7 +848,10 @@ impl Journal {
         let db = db_arc
             .lock()
             .map_err(|e| Error::Invalid(format!("db lock poisoned: {e}")))?;
-        db.get_retrieval_strength(entry_id)
+        let meta = db
+            .get_entry_by_uname(entry_id)?
+            .ok_or_else(|| Error::EntryNotFound(entry_id.to_string()))?;
+        db.get_retrieval_strength(&meta.id)
     }
 
     /// Pin an entry by setting its `retrieval_strength` to a specific value.
@@ -931,7 +860,7 @@ impl Journal {
     ///
     /// # Arguments
     /// - `persona`: persona id (matches persona-pack id)
-    /// - `entry_id`: entry identifier (text id, e.g. `"2024-01_00001"`)
+    /// - `entry_id`: uname, e.g. `"emo/2024-01_000001"`
     /// - `strength`: target retrieval strength; if `None`, defaults to `1.0`
     ///
     /// # Returns
@@ -956,7 +885,7 @@ impl Journal {
     ///
     /// # Arguments
     /// - `persona`: persona id (matches persona-pack id)
-    /// - `entry_id`: entry identifier (text id, e.g. `"2024-01_00001"`)
+    /// - `entry_id`: uname, e.g. `"emo/2024-01_000001"`
     ///
     /// # Returns
     /// `Ok(())` on success.
@@ -1056,9 +985,15 @@ impl Journal {
                     .get_kind(&row.kind)?
                     .ok_or_else(|| Error::Invalid(format!("unknown kind: {}", row.kind)))?;
                 let path = if kind_cfg.versioning {
-                    versioned_path(&self.root, persona, &row.kind, &row.entry_id, row.version)
+                    versioned_path(
+                        &self.root,
+                        persona,
+                        &row.kind,
+                        &row.seq_in_kind,
+                        row.version,
+                    )
                 } else {
-                    flat_path(&self.root, persona, &row.kind, &row.entry_id)
+                    flat_path(&self.root, persona, &row.kind, &row.seq_in_kind)
                 };
                 pairs.push((path, row.body));
             }
@@ -1129,106 +1064,6 @@ mod tests {
         let list = j.kind_list("shi").unwrap();
         let found = list.iter().find(|k| k.kind == "test_kind").unwrap();
         assert_eq!(found.tags, vec!["alpha", "beta", "gamma"]);
-    }
-
-    #[test]
-    fn import_entry_inserts_new_with_caller_supplied_identity() {
-        let tmp = TempDir::new().unwrap();
-        let j = Journal::open(tmp.path().to_path_buf());
-        j.ensure_default_kinds("shi").unwrap();
-        let id = j
-            .import_entry(
-                "shi",
-                "emo",
-                2024,
-                8,
-                12,
-                "2024-08-01T00:00:00Z",
-                "# legacy entry\nimported from FS",
-                vec!["legacy".into()],
-                false,
-            )
-            .unwrap();
-        assert_eq!(id, "2024-08_00012");
-        let body = j.entry_read("shi", &id, None).unwrap();
-        assert!(body.contains("legacy entry"));
-    }
-
-    #[test]
-    fn import_entry_returns_already_exists_without_force() {
-        let tmp = TempDir::new().unwrap();
-        let j = Journal::open(tmp.path().to_path_buf());
-        j.ensure_default_kinds("shi").unwrap();
-        j.import_entry(
-            "shi",
-            "emo",
-            2024,
-            8,
-            12,
-            "2024-08-01T00:00:00Z",
-            "# first",
-            vec![],
-            false,
-        )
-        .unwrap();
-        let err = j
-            .import_entry(
-                "shi",
-                "emo",
-                2024,
-                8,
-                12,
-                "2024-08-01T00:00:00Z",
-                "# second",
-                vec![],
-                false,
-            )
-            .unwrap_err();
-        assert!(matches!(err, Error::AlreadyExists(ref id) if id == "2024-08_00012"));
-        // body remains the original
-        let body = j.entry_read("shi", "2024-08_00012", None).unwrap();
-        assert!(body.contains("first"));
-        assert!(!body.contains("second"));
-    }
-
-    #[test]
-    fn import_entry_force_override_appends_version() {
-        let tmp = TempDir::new().unwrap();
-        let j = Journal::open(tmp.path().to_path_buf());
-        j.ensure_default_kinds("shi").unwrap();
-        j.import_entry(
-            "shi",
-            "emo",
-            2024,
-            8,
-            12,
-            "2024-08-01T00:00:00Z",
-            "# v1 body",
-            vec![],
-            false,
-        )
-        .unwrap();
-        let id = j
-            .import_entry(
-                "shi",
-                "emo",
-                2024,
-                8,
-                12,
-                "2024-08-01T00:00:00Z",
-                "# v2 body overridden",
-                vec![],
-                true,
-            )
-            .unwrap();
-        assert_eq!(id, "2024-08_00012");
-        // entry_read returns the current (= latest) version body
-        let body = j.entry_read("shi", &id, None).unwrap();
-        assert!(body.contains("v2 body overridden"));
-        assert!(!body.contains("v1 body"));
-        // and v1 is still recoverable
-        let v1 = j.entry_read("shi", &id, Some(1)).unwrap();
-        assert!(v1.contains("v1 body"));
     }
 
     #[cfg(unix)]
@@ -1976,7 +1811,8 @@ tags = []
         // Access the DB via db_cache (same Arc<Mutex<Db>> that Journal uses).
         let db_arc = j.open_db(persona).unwrap();
         let db = db_arc.lock().unwrap();
-        db.set_created_at_for_test(&id_old, &ts_30d_str).unwrap();
+        db.set_created_at_for_test_by_uname(&id_old, &ts_30d_str)
+            .unwrap();
         drop(db);
 
         // query_by_retrieval must return [id_new, id_old] — decay score drives ORDER BY.
@@ -2062,8 +1898,10 @@ tags = []
         {
             let db_arc = j.open_db(persona).unwrap();
             let db = db_arc.lock().unwrap();
-            db.set_created_at_for_test(&id_low, &now_iso).unwrap();
-            db.set_created_at_for_test(&id_high, &now_iso).unwrap();
+            db.set_created_at_for_test_by_uname(&id_low, &now_iso)
+                .unwrap();
+            db.set_created_at_for_test_by_uname(&id_high, &now_iso)
+                .unwrap();
         }
 
         j.set_retrieval_strength(persona, &id_low, 0.5).unwrap();
@@ -2145,12 +1983,14 @@ tags = []
         {
             let db_arc_high = j.open_db(persona_high).unwrap();
             let db = db_arc_high.lock().unwrap();
-            db.set_created_at_for_test(&id_high, &now_iso).unwrap();
+            db.set_created_at_for_test_by_uname(&id_high, &now_iso)
+                .unwrap();
         }
         {
             let db_arc_low = j.open_db(persona_low).unwrap();
             let db = db_arc_low.lock().unwrap();
-            db.set_created_at_for_test(&id_low, &now_iso).unwrap();
+            db.set_created_at_for_test_by_uname(&id_low, &now_iso)
+                .unwrap();
         }
 
         let scored_high = {
@@ -2224,9 +2064,12 @@ tags = []
         {
             let db_arc = j.open_db(persona).unwrap();
             let db = db_arc.lock().unwrap();
-            db.set_created_at_for_test(&id_zero, &now_iso).unwrap();
-            db.set_created_at_for_test(&id_mid, &now_iso).unwrap();
-            db.set_created_at_for_test(&id_full, &now_iso).unwrap();
+            db.set_created_at_for_test_by_uname(&id_zero, &now_iso)
+                .unwrap();
+            db.set_created_at_for_test_by_uname(&id_mid, &now_iso)
+                .unwrap();
+            db.set_created_at_for_test_by_uname(&id_full, &now_iso)
+                .unwrap();
         }
 
         j.set_retrieval_strength(persona, &id_zero, 0.0).unwrap();
@@ -2247,7 +2090,7 @@ tags = []
             .unwrap();
         let score_zero = scored
             .iter()
-            .find(|(row, _)| row.id == id_zero)
+            .find(|(row, _)| row.uname == id_zero)
             .map(|(_, s)| *s)
             .expect("id_zero must be in scored results");
         assert_eq!(
@@ -2417,13 +2260,13 @@ tags = []
         let j = Journal::open(tmp.path().to_path_buf());
         j.ensure_default_kinds("shi").unwrap();
 
-        let get_result = j.get_retrieval_strength("shi", "2099-01_99999");
+        let get_result = j.get_retrieval_strength("shi", "emo/2099-01_999999");
         assert!(
             matches!(get_result, Err(Error::EntryNotFound(_))),
             "expected EntryNotFound for get on missing entry, got: {get_result:?}"
         );
 
-        let set_result = j.set_retrieval_strength("shi", "2099-01_99999", 0.5);
+        let set_result = j.set_retrieval_strength("shi", "emo/2099-01_999999", 0.5);
         assert!(
             matches!(set_result, Err(Error::EntryNotFound(_))),
             "expected EntryNotFound for set on missing entry, got: {set_result:?}"
@@ -2667,12 +2510,13 @@ tags = []
             ids.push(id);
         }
 
-        // Equalise created_at so decay is uniform across entries
+        // Equalise created_at so decay is uniform across entries.
+        // Use set_created_at_for_test_by_uname so id (uname) is resolved to UUID internally.
         {
             let db_arc = j.open_db(persona).unwrap();
             let db = db_arc.lock().unwrap();
             for id in &ids {
-                db.set_created_at_for_test(id, &now_iso).unwrap();
+                db.set_created_at_for_test_by_uname(id, &now_iso).unwrap();
             }
         }
 
@@ -3231,20 +3075,42 @@ tags = []
         // Insert two entries directly with kind="archive" — bypassing say() which
         // rejects NamedIndex mode. The archive kind is registered so the JOIN in
         // query_by_retrieval_with_scores resolves correctly.
-        let id_recent = "archive-recent-test-entry";
-        let id_old = "archive-old-test-entry";
+        let now_ym = format!("{:04}-{:02}", now.year(), u8::from(now.month()));
+        let seq_in_kind_recent = crate::storage::seq_in_kind_str(&now_ym, 1);
+        let seq_in_kind_old = crate::storage::seq_in_kind_str(&now_ym, 2);
+        let id_recent = crate::storage::uname("archive", &seq_in_kind_recent);
+        let id_old = crate::storage::uname("archive", &seq_in_kind_old);
         {
             let db_arc = j.open_db(persona).unwrap();
             let db = db_arc.lock().unwrap();
-            db.insert_entry(id_recent, "archive", &now_iso, Some("recent summary"), &[])
-                .unwrap();
-            db.insert_entry(id_old, "archive", &ts_365d_str, Some("old summary"), &[])
-                .unwrap();
+            let uuid_recent = uuid::Uuid::now_v7().to_string();
+            let uuid_old = uuid::Uuid::now_v7().to_string();
+            db.insert_entry(
+                &uuid_recent,
+                &id_recent,
+                "archive",
+                &seq_in_kind_recent,
+                &now_iso,
+                Some("recent summary"),
+                &[],
+            )
+            .unwrap();
+            db.insert_entry(
+                &uuid_old,
+                &id_old,
+                "archive",
+                &seq_in_kind_old,
+                &ts_365d_str,
+                Some("old summary"),
+                &[],
+            )
+            .unwrap();
         }
 
         // Set both to low retrieval_strength so score < 0.01.
-        j.set_retrieval_strength(persona, id_recent, 0.005).unwrap();
-        j.set_retrieval_strength(persona, id_old, 0.005).unwrap();
+        j.set_retrieval_strength(persona, &id_recent, 0.005)
+            .unwrap();
+        j.set_retrieval_strength(persona, &id_old, 0.005).unwrap();
 
         let output = j.archive_index_render(persona).unwrap();
 
@@ -3262,17 +3128,21 @@ tags = []
         );
         // Both archive-eligible entries must appear.
         assert!(
-            output.contains(id_recent),
+            output.contains(&id_recent as &str),
             "recent entry must appear in archive output: {output}"
         );
         assert!(
-            output.contains(id_old),
+            output.contains(&id_old as &str),
             "old entry must appear in archive output: {output}"
         );
         // id_recent (created_at = now) must appear before id_old (created_at = 365d ago)
         // because output is sorted by created_at DESC.
-        let pos_recent = output.find(id_recent).expect("id_recent must be in output");
-        let pos_old = output.find(id_old).expect("id_old must be in output");
+        let pos_recent = output
+            .find(&id_recent as &str)
+            .expect("id_recent must be in output");
+        let pos_old = output
+            .find(&id_old as &str)
+            .expect("id_old must be in output");
         assert!(
             pos_recent < pos_old,
             "recent entry (created_at=now) must appear before old entry (created_at=365d ago) in DESC order"

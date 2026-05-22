@@ -36,15 +36,20 @@ are provided as a read projection regenerated from the DB.
     _journal.db                      # SQLite meta (source of truth)
     _index.md                        # RootIndex (auto, DB projection)
     <kind>/
-      <persona>_<kind>_<entryId>/    # versioning ON
-        <persona>_<kind>_<entryId>_v1.md
+      <seq_in_kind>.md               # versioning OFF  (e.g. emo/2024-08_000001.md)
+      <seq_in_kind>/                 # versioning ON
+        <seq_in_kind>_v1.md
       _index.md                      # kind _index (optional)
     <persona>_<kind>_index.md        # named_index (hand or query projection)
 ```
 
+Entry `uname` format: `{kind}/{ym}_{seq:06}` (e.g. `emo/2024-08_000001`).
+`uname` is the sole entry identifier across all MCP tools, CLI commands, and public APIs.
+The internal UUID v7 primary key is never exposed outside the library.
+
 ## MCP Tools
 
-- `journal_say` — append a new entry, return `{id}`
+- `journal_say` — append a new entry, return `{id}` (uname, e.g. `"emo/2024-08_000001"`)
 - `journal_query_latest` — latest N entries of a kind
 - `journal_entry_read` — read entry body (optional version)
 - `journal_kind_register` — register / replace a kind config (TOML body)
@@ -69,7 +74,7 @@ via `journal_kind_register` are never overwritten).
 [[kinds]]
 kind = "emo"
 mode = "entries"
-path_template = "{persona}/{kind}/{persona}_{kind}_{yyyy}-{mm}_{seq:05}.md"
+path_template = "{persona}/{kind}/{seq_in_kind}.md"
 versioning = true
 indexed = true
 tags = []

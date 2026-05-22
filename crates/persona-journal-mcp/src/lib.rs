@@ -44,6 +44,7 @@ pub struct QueryLatestParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct EntryReadParams {
     pub persona: String,
+    /// Entry uname (e.g. `"emo/2024-08_000012"`). Used as the lookup key.
     pub id: String,
     /// Optional version. Defaults to current.
     pub version: Option<u32>,
@@ -78,11 +79,13 @@ pub struct ReloadKindsParams {
 
 #[derive(Debug, Serialize)]
 struct SayResult {
+    /// Entry uname in `{kind}/{ym}_{seq:06}` format.
     id: String,
 }
 
 #[derive(Debug, Serialize)]
 struct EntryRowOut {
+    /// Entry uname in `{kind}/{ym}_{seq:06}` format.
     id: String,
     kind: String,
     created_at: String,
@@ -123,7 +126,7 @@ impl JournalService {
         Journal::open(root)
     }
 
-    /// Append a new entry. Returns `{ "id": "<YYYY-MM_NNNNN>" }`.
+    /// Append a new entry. Returns `{ "id": "<kind>/<ym>_<seq:06>" }` (e.g. `"emo/2024-08_000012"`).
     /// Auto-registers the `emo` preset kind on first use if no kinds exist.
     #[tool(name = "journal_say", annotations(open_world_hint = false))]
     async fn say(&self, Parameters(p): Parameters<SayParams>) -> Result<String, String> {
