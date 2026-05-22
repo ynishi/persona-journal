@@ -344,9 +344,12 @@ tags = []
             "tags": [],
         }),
     );
+    let say_id = say_result["id"]
+        .as_str()
+        .expect("journal_say must return id as string");
     assert!(
-        say_result.get("id").is_some(),
-        "journal_say should return id: {say_result:?}"
+        say_id.starts_with("emo/"),
+        "journal_say id must be uname with kind prefix: {say_id}"
     );
 
     // All 3 kinds from .journal.toml should now be registered.

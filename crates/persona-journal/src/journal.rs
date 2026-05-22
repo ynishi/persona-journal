@@ -800,7 +800,7 @@ impl Journal {
     ///
     /// # Arguments
     /// - `persona`: persona id (matches persona-pack id)
-    /// - `entry_id`: entry identifier (text id, e.g. `"2024-01_00001"`)
+    /// - `entry_id`: uname, e.g. `"emo/2024-01_000001"`
     /// - `value`: new retrieval strength; must be in `[0.0, 1.0]` and not NaN
     ///
     /// # Returns
@@ -860,7 +860,7 @@ impl Journal {
     ///
     /// # Arguments
     /// - `persona`: persona id (matches persona-pack id)
-    /// - `entry_id`: entry identifier (text id, e.g. `"2024-01_00001"`)
+    /// - `entry_id`: uname, e.g. `"emo/2024-01_000001"`
     /// - `strength`: target retrieval strength; if `None`, defaults to `1.0`
     ///
     /// # Returns
@@ -885,7 +885,7 @@ impl Journal {
     ///
     /// # Arguments
     /// - `persona`: persona id (matches persona-pack id)
-    /// - `entry_id`: entry identifier (text id, e.g. `"2024-01_00001"`)
+    /// - `entry_id`: uname, e.g. `"emo/2024-01_000001"`
     ///
     /// # Returns
     /// `Ok(())` on success.
@@ -2260,13 +2260,13 @@ tags = []
         let j = Journal::open(tmp.path().to_path_buf());
         j.ensure_default_kinds("shi").unwrap();
 
-        let get_result = j.get_retrieval_strength("shi", "2099-01_99999");
+        let get_result = j.get_retrieval_strength("shi", "emo/2099-01_999999");
         assert!(
             matches!(get_result, Err(Error::EntryNotFound(_))),
             "expected EntryNotFound for get on missing entry, got: {get_result:?}"
         );
 
-        let set_result = j.set_retrieval_strength("shi", "2099-01_99999", 0.5);
+        let set_result = j.set_retrieval_strength("shi", "emo/2099-01_999999", 0.5);
         assert!(
             matches!(set_result, Err(Error::EntryNotFound(_))),
             "expected EntryNotFound for set on missing entry, got: {set_result:?}"
