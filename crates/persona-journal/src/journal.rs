@@ -513,6 +513,113 @@ impl Journal {
         Ok(entry_uname)
     }
 
+    /// Import a legacy FS entry into the journal under the new UUID v7 + uname schema.
+    ///
+    /// # Arguments
+    /// - `persona` — persona name (e.g. `"shi"`)
+    /// - `kind` — kind name (e.g. `"emo"`); must be an `Entries`-mode kind
+    /// - `year_month` — month string `"YYYY-MM"` (e.g. `"2026-05"`)
+    /// - `seq` — sequential index within `(kind, year_month)`; converted to 6-digit via `seq_in_kind_str`
+    /// - `created_at` — RFC 3339 timestamp (e.g. `"2026-05-01T00:00:00Z"`)
+    /// - `body` — entry body text
+    /// - `tags` — tag list
+    /// - `force_override` — when `true` and the entry already exists, appends a new version
+    ///
+    /// # Returns
+    /// `Ok(uname)` where `uname` is the canonical entry identifier (e.g. `"emo/2026-05_000001"`).
+    /// UUID is strictly internal and never exposed in the return value or error payloads.
+    ///
+    /// # Errors
+    /// - `Error::UnknownKind` — `kind` is not registered for `persona`
+    /// - `Error::Invalid` — `kind` is not in `Entries` mode, or the db lock is poisoned
+    /// - `Error::AlreadyExists(uname)` — entry already exists and `force_override` is `false`
+    /// - `Error::Sqlite` / `Error::Io` — DB or filesystem failure
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_entry(
+        &self,
+        persona: &str,
+        kind: &str,
+        year_month: &str,
+        seq: u32,
+        created_at: &str,
+        body: &str,
+        tags: Vec<String>,
+        force_override: bool,
+    ) -> Result<String> {
+        let db_arc = self.open_db(persona)?;
+        let db = db_arc
+            .lock()
+            .map_err(|e| Error::Invalid(format!("db lock poisoned: {e}")))?;
+        let kind_cfg = db
+            .get_kind(kind)?
+            .ok_or_else(|| Error::UnknownKind(kind.to_string()))?;
+        if !matches!(kind_cfg.mode, KindMode::Entries) {
+            return Err(Error::Invalid(
+                "import_entry supports entries mode only".to_string(),
+            ));
+        }
+
+        // CRUX-2: normalization always routes through seq_in_kind_str; no direct padding here.
+        let seq_in_kind = seq_in_kind_str(year_month, seq);
+        let uname = make_uname(kind, &seq_in_kind);
+
+        let existing = db.get_entry_by_uname(&uname)?;
+
+        match existing {
+            None => {
+                // New entry: insert via say_atomic.
+                let first_line = extract_first_line(body);
+                let path = if kind_cfg.versioning {
+                    versioned_path(&self.root, persona, kind, &seq_in_kind, 1)
+                } else {
+                    flat_path(&self.root, persona, kind, &seq_in_kind)
+                };
+                let rel = path
+                    .strip_prefix(&self.root)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                db.say_atomic(
+                    &uname,
+                    kind,
+                    &seq_in_kind,
+                    created_at,
+                    first_line.as_deref(),
+                    &tags,
+                    1,
+                    &rel,
+                    body,
+                )?;
+                // --- Tx done. Projection regen is best-effort. ---
+                self.project_entry_file_best_effort(&path, body);
+                if kind_cfg.indexed {
+                    self.project_index_best_effort(&db, persona, created_at);
+                }
+                Ok(uname)
+            }
+            Some(_) if !force_override => {
+                // CRUX-1: error payload exposes only uname, never UUID.
+                Err(Error::AlreadyExists(uname))
+            }
+            Some(row) => {
+                // CRUX-3: retrieve row.id (UUID) from get_entry_by_uname before calling add_version.
+                // Never pass uname or a reconstructed value as the version target.
+                let new_version = row.current_version + 1;
+                let path = versioned_path(&self.root, persona, kind, &seq_in_kind, new_version);
+                let rel = path
+                    .strip_prefix(&self.root)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+                db.add_version(&row.id, new_version, body, &rel, created_at)?;
+                // --- Tx done. Projection regen is best-effort. ---
+                self.project_entry_file_best_effort(&path, body);
+                if kind_cfg.indexed {
+                    self.project_index_best_effort(&db, persona, created_at);
+                }
+                Ok(uname)
+            }
+        }
+    }
+
     /// Single implementation of "render and write `_index.md` for one persona".
     ///
     /// Both `project_index_best_effort` (called from `say`) and `projection_rebuild`
@@ -3147,5 +3254,191 @@ tags = []
             pos_recent < pos_old,
             "recent entry (created_at=now) must appear before old entry (created_at=365d ago) in DESC order"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // import_entry tests
+    // -------------------------------------------------------------------------
+
+    /// T1 — happy path: inserting a new entry returns uname and body is readable.
+    #[test]
+    fn import_entry_inserts_new() {
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        j.ensure_default_kinds("shi").unwrap();
+
+        let uname = j
+            .import_entry(
+                "shi",
+                "emo",
+                "2026-05",
+                1,
+                "2026-05-01T00:00:00Z",
+                "# first import\nbody content",
+                vec![],
+                false,
+            )
+            .unwrap();
+
+        // Return value is a uname string (not UUID).
+        assert_eq!(uname, "emo/2026-05_000001");
+        // Body is readable via DB (DB is SoT).
+        let body = j.entry_read("shi", &uname, None).unwrap();
+        assert!(body.contains("first import"));
+    }
+
+    /// T2 — error path: inserting same uname without force returns AlreadyExists(uname).
+    #[test]
+    fn import_entry_returns_already_exists_without_force() {
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        j.ensure_default_kinds("shi").unwrap();
+
+        j.import_entry(
+            "shi",
+            "emo",
+            "2026-05",
+            1,
+            "2026-05-01T00:00:00Z",
+            "# original body",
+            vec![],
+            false,
+        )
+        .unwrap();
+
+        let err = j
+            .import_entry(
+                "shi",
+                "emo",
+                "2026-05",
+                1,
+                "2026-05-01T00:00:00Z",
+                "# duplicate body",
+                vec![],
+                false,
+            )
+            .unwrap_err();
+
+        match err {
+            Error::AlreadyExists(u) => assert_eq!(u, "emo/2026-05_000001"),
+            other => panic!("expected AlreadyExists, got: {other:?}"),
+        }
+        // Original body must be unchanged.
+        let body = j.entry_read("shi", "emo/2026-05_000001", None).unwrap();
+        assert!(body.contains("original body"));
+        assert!(!body.contains("duplicate body"));
+    }
+
+    /// T1 / T3 — force_override appends v2; v1 remains accessible.
+    #[test]
+    fn import_entry_force_override_appends_version() {
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        j.ensure_default_kinds("shi").unwrap();
+
+        // Insert v1.
+        let uname = j
+            .import_entry(
+                "shi",
+                "emo",
+                "2026-05",
+                2,
+                "2026-05-02T00:00:00Z",
+                "# version one body",
+                vec![],
+                false,
+            )
+            .unwrap();
+        assert_eq!(uname, "emo/2026-05_000002");
+
+        // force_override=true appends v2; returns uname (not UUID).
+        let uname2 = j
+            .import_entry(
+                "shi",
+                "emo",
+                "2026-05",
+                2,
+                "2026-05-02T12:00:00Z",
+                "# version two body",
+                vec![],
+                true,
+            )
+            .unwrap();
+        assert_eq!(uname2, "emo/2026-05_000002");
+
+        // Latest (no version) returns v2 body.
+        let body_latest = j.entry_read("shi", &uname, None).unwrap();
+        assert!(
+            body_latest.contains("version two body"),
+            "latest body must be v2: {body_latest}"
+        );
+        // v1 still accessible by explicit version.
+        let body_v1 = j.entry_read("shi", &uname, Some(1)).unwrap();
+        assert!(
+            body_v1.contains("version one body"),
+            "v1 body must still exist: {body_v1}"
+        );
+    }
+
+    /// T2 — CRUX-2: seq=1 with year_month="2026-05" must produce uname "emo/2026-05_000001".
+    /// Verifies normalization routes through seq_in_kind_str, never raw padding.
+    #[test]
+    fn import_entry_uses_canonical_6digit_seq_in_kind() {
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        j.ensure_default_kinds("shi").unwrap();
+
+        let uname = j
+            .import_entry(
+                "shi",
+                "emo",
+                "2026-05",
+                1,
+                "2026-05-01T00:00:00Z",
+                "# canonical seq test",
+                vec![],
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(
+            uname, "emo/2026-05_000001",
+            "6-digit normalization must produce emo/2026-05_000001"
+        );
+    }
+
+    /// T3 — error path: non-entries (NamedIndex) kind must return Err(Invalid).
+    #[test]
+    fn import_entry_rejects_named_index_mode() {
+        use crate::schema::KindConfig;
+
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        j.ensure_default_kinds("shi").unwrap();
+
+        // Register a NamedIndex kind.
+        let cfg = KindConfig::preset_archive();
+        j.kind_register("shi", &cfg).unwrap();
+
+        let err = j
+            .import_entry(
+                "shi",
+                "archive",
+                "2026-05",
+                1,
+                "2026-05-01T00:00:00Z",
+                "# should be rejected",
+                vec![],
+                false,
+            )
+            .unwrap_err();
+
+        match err {
+            Error::Invalid(msg) => assert!(
+                msg.contains("entries mode only"),
+                "error message must mention entries mode only: {msg}"
+            ),
+            other => panic!("expected Error::Invalid, got: {other:?}"),
+        }
     }
 }
