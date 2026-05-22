@@ -503,6 +503,93 @@ impl Journal {
         Ok(id)
     }
 
+    /// Import a legacy FS entry into the DB with caller-supplied `(year, month, seq)`
+    /// and `created_at`.
+    ///
+    /// Unlike [`Journal::say`], which auto-assigns timestamp and seq via
+    /// `now_utc()` + `next_seq()`, this API preserves the original FS-derived
+    /// identity for migration use. Entries mode only (matches `say` MVP scope).
+    ///
+    /// # Behavior
+    /// - id = `entry_id(year, month, seq)` (e.g. `"2024-08_00012"`)
+    /// - If no existing row: inserts as version 1 (same path as `say`).
+    /// - If existing row and `force_override == false`: returns
+    ///   `Err(Error::AlreadyExists(id))` without writing.
+    /// - If existing row and `force_override == true`: appends a new version
+    ///   (`current_version + 1`) with the supplied body, updating `updated_at`.
+    /// - FS projection is best-effort (matches `say`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_entry(
+        &self,
+        persona: &str,
+        kind: &str,
+        year: i32,
+        month: u8,
+        seq: u32,
+        created_at: &str,
+        body: &str,
+        tags: Vec<String>,
+        force_override: bool,
+    ) -> Result<String> {
+        let db_arc = self.open_db(persona)?;
+        let db = db_arc
+            .lock()
+            .map_err(|e| Error::Invalid(format!("db lock poisoned: {e}")))?;
+        let kind_cfg = db
+            .get_kind(kind)?
+            .ok_or_else(|| Error::UnknownKind(kind.to_string()))?;
+        if !matches!(kind_cfg.mode, KindMode::Entries) {
+            return Err(Error::Invalid(
+                "import_entry() supports entries mode only".to_string(),
+            ));
+        }
+
+        let id = entry_id(year, month as u32, seq);
+        let first_line = extract_first_line(body);
+        let existing = db.get_entry(&id)?;
+
+        let (version, _is_new) = match existing {
+            None => (1u32, true),
+            Some(_) if !force_override => {
+                return Err(Error::AlreadyExists(id));
+            }
+            Some(row) => (row.current_version + 1, false),
+        };
+
+        let path = if kind_cfg.versioning {
+            versioned_path(&self.root, persona, kind, &id, version)
+        } else {
+            flat_path(&self.root, persona, kind, &id)
+        };
+        let rel = path
+            .strip_prefix(&self.root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+
+        if version == 1 {
+            db.say_atomic(
+                &id,
+                kind,
+                created_at,
+                first_line.as_deref(),
+                &tags,
+                1,
+                &rel,
+                body,
+            )?;
+        } else {
+            db.add_version(&id, version, body, &rel, created_at)?;
+        }
+
+        // Best-effort FS projection (matches `say`).
+        self.project_entry_file_best_effort(&path, body);
+        if kind_cfg.indexed {
+            self.project_index_best_effort(&db, persona, created_at);
+        }
+
+        Ok(id)
+    }
+
     /// Single implementation of "render and write `_index.md` for one persona".
     ///
     /// Both `project_index_best_effort` (called from `say`) and `projection_rebuild`
@@ -1042,6 +1129,106 @@ mod tests {
         let list = j.kind_list("shi").unwrap();
         let found = list.iter().find(|k| k.kind == "test_kind").unwrap();
         assert_eq!(found.tags, vec!["alpha", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn import_entry_inserts_new_with_caller_supplied_identity() {
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        j.ensure_default_kinds("shi").unwrap();
+        let id = j
+            .import_entry(
+                "shi",
+                "emo",
+                2024,
+                8,
+                12,
+                "2024-08-01T00:00:00Z",
+                "# legacy entry\nimported from FS",
+                vec!["legacy".into()],
+                false,
+            )
+            .unwrap();
+        assert_eq!(id, "2024-08_00012");
+        let body = j.entry_read("shi", &id, None).unwrap();
+        assert!(body.contains("legacy entry"));
+    }
+
+    #[test]
+    fn import_entry_returns_already_exists_without_force() {
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        j.ensure_default_kinds("shi").unwrap();
+        j.import_entry(
+            "shi",
+            "emo",
+            2024,
+            8,
+            12,
+            "2024-08-01T00:00:00Z",
+            "# first",
+            vec![],
+            false,
+        )
+        .unwrap();
+        let err = j
+            .import_entry(
+                "shi",
+                "emo",
+                2024,
+                8,
+                12,
+                "2024-08-01T00:00:00Z",
+                "# second",
+                vec![],
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::AlreadyExists(ref id) if id == "2024-08_00012"));
+        // body remains the original
+        let body = j.entry_read("shi", "2024-08_00012", None).unwrap();
+        assert!(body.contains("first"));
+        assert!(!body.contains("second"));
+    }
+
+    #[test]
+    fn import_entry_force_override_appends_version() {
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        j.ensure_default_kinds("shi").unwrap();
+        j.import_entry(
+            "shi",
+            "emo",
+            2024,
+            8,
+            12,
+            "2024-08-01T00:00:00Z",
+            "# v1 body",
+            vec![],
+            false,
+        )
+        .unwrap();
+        let id = j
+            .import_entry(
+                "shi",
+                "emo",
+                2024,
+                8,
+                12,
+                "2024-08-01T00:00:00Z",
+                "# v2 body overridden",
+                vec![],
+                true,
+            )
+            .unwrap();
+        assert_eq!(id, "2024-08_00012");
+        // entry_read returns the current (= latest) version body
+        let body = j.entry_read("shi", &id, None).unwrap();
+        assert!(body.contains("v2 body overridden"));
+        assert!(!body.contains("v1 body"));
+        // and v1 is still recoverable
+        let v1 = j.entry_read("shi", &id, Some(1)).unwrap();
+        assert!(v1.contains("v1 body"));
     }
 
     #[cfg(unix)]

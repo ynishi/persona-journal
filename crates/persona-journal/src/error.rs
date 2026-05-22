@@ -18,6 +18,8 @@ pub enum Error {
     UnknownKind(String),
     #[error("entry not found: {0}")]
     EntryNotFound(String),
+    #[error("entry already exists: {0}")]
+    AlreadyExists(String),
     #[error("invalid: {0}")]
     Invalid(String),
 }
