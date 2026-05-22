@@ -11,6 +11,7 @@ const ROOT_INDEX_LATEST_N: usize = 10;
 
 /// Write RootIndex (spec §6.1) to `<root>/<persona>/_index.md`.
 /// Collects kinds where `indexed = true` and lists the latest N entries per kind.
+/// Each entry line uses the uname format `{kind}/{ym}_{seq:06}` (e.g. `"emo/2024-08_000001"`).
 pub fn render_root_index(db: &Db, persona: &str, now_iso: &str) -> Result<String> {
     let kinds = db.list_indexed_kinds()?;
     let mut out = String::new();
