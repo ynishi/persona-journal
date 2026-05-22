@@ -118,7 +118,10 @@ The same binary doubles as a CLI:
 ```sh
 persona-journal-mcp kind-list <persona>
 persona-journal-mcp projection-rebuild <persona>
+persona-journal-mcp import-fs <persona> <kind> <source-dir> [--force-override] [--dry-run]
 ```
+
+`import-fs` walks `<source-dir>` for `YYYY-MM_NNNNN.md` files and imports them as `entries`-mode entries under the given persona and kind. `--force-override` appends a new version instead of returning a conflict error. `--dry-run` performs all parsing and existence checks without writing to the DB.
 
 (default subcommand is `mcp`, which serves over stdio.)
 

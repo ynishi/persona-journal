@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **`Error::AlreadyExists(String)` re-added** — `persona_journal::Error` gains back the `AlreadyExists(String)` variant (value is the `uname` of the conflicting entry, e.g. `"emo/2026-05_000001"`). Complements the re-introduced `import_entry` / `ImportFs` paths. `From<CoreError>` exhaustive match is unaffected (no `AlreadyExists` on the `CoreError` side).
+
+- **`Journal::import_entry` re-implemented** — `pub fn import_entry(persona, kind, year_month, seq, created_at, body, tags, force_override) -> Result<String>` is added after `say()` (`journal.rs`). Returns the `uname` of the written entry (CRUX-3: UUID is never returned). Follows the same `say()` flow: kind guard (entries-mode only) → `seq_in_kind_str(year_month, seq)` → `make_uname(kind, seq_in_kind)` → existence check via `get_entry_by_uname` → `say_atomic` (new) or `add_version` (force-override). Force-override retrieves `row.id` (UUID) from `get_entry_by_uname` before calling `add_version` — UUID is never passed in from the CLI layer. Legacy 5-digit `seq` values are normalised to 6-digit `seq_in_kind` exclusively through `seq_in_kind_str`, never by direct string padding. Unit tests: happy-path new entry / `AlreadyExists` on conflict / force-override appends version v2 / canonical 6-digit normalisation / non-entries mode rejection.
+
+- **`Cmd::ImportFs` CLI subcommand re-added** — `persona-journal-mcp import-fs <persona> <kind> <source> [--force-override] [--dry-run]` is available again. `parse_entry_filename` helper parses `YYYY-MM_NNNNN.md` filenames to `(year, month, seq)` numerically (no string padding in the CLI layer). `run_import_fs` handler dispatches to `Journal::import_entry`; on `Error::AlreadyExists` the entry is recorded in the conflict column; other errors emit `tracing::warn!` and are recorded in the error column. `--dry-run` performs all parsing and existence checks without writing. Unit tests in `main.rs`: filename parse OK / parse error / dry-run does not write / real → conflict → force-override sequence.
+
 ### Changed
 
 - **`entries` schema full redesign — UUID v7 primary key + `uname` first-class identifier.**
@@ -39,11 +47,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **`crates/persona-journal-mcp` E2E MCP tests** — `journal_say` id-format assertions updated to validate uname format.
 
-### Removed
-
-- **`Journal::import_entry`** — removed. The `ImportFs` CLI subcommand (`persona-journal-mcp import-fs`), `parse_entry_filename`, and the three associated tests in `mcp/main.rs` are also removed. Use the standalone `persona-journal-migrate` tooling for FS→DB imports.
-
-- **`crate::error::Error::AlreadyExists`** variant — removed. All callers were exclusive to `import_entry` and `ImportFs`; with those removed, the variant had no remaining callers.
 
 ## [0.1.0] - 2026-05-21
 
