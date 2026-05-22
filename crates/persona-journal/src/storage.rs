@@ -3,7 +3,9 @@
 //! Pure path helpers are re-exported from `persona_journal_core::storage`.
 //! I/O helpers (`write_file`, `read_file`) remain here.
 
-pub use persona_journal_core::storage::{entry_id, extract_first_line, flat_path, versioned_path};
+pub use persona_journal_core::storage::{
+    extract_first_line, flat_path, seq_in_kind_str, uname, versioned_path,
+};
 
 use std::path::Path;
 

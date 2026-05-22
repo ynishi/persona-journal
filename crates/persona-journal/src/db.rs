@@ -2,6 +2,7 @@
 
 use rusqlite::{functions::FunctionFlags, params, Connection, OptionalExtension, Transaction};
 use std::path::Path;
+use uuid::Uuid;
 
 use crate::error::Result;
 use crate::schema::{DecayConfig, KindConfig, KindMode, NamedSource};
@@ -28,14 +29,18 @@ CREATE TABLE IF NOT EXISTS kinds (
 
 CREATE TABLE IF NOT EXISTS entries (
     id                TEXT PRIMARY KEY,
+    uname             TEXT NOT NULL UNIQUE,
     kind              TEXT NOT NULL REFERENCES kinds(name),
+    seq_in_kind       TEXT NOT NULL,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL,
     current_version   INTEGER NOT NULL DEFAULT 1,
     first_line_cache  TEXT,
-    retrieval_strength REAL NOT NULL DEFAULT 1.0
+    retrieval_strength REAL NOT NULL DEFAULT 1.0,
+    CHECK(uname = kind || '/' || seq_in_kind)
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_kind_seq ON entries(kind, seq_in_kind);
 CREATE INDEX IF NOT EXISTS idx_entries_kind_created ON entries(kind, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS tags (
@@ -66,24 +71,27 @@ CREATE TABLE IF NOT EXISTS versions (
 
 #[derive(Debug, Clone)]
 pub struct EntryMetaRow {
-    pub id: String,
-    pub kind: String,
-    pub created_at: String,
-    pub updated_at: String,
-    pub current_version: u32,
-    pub first_line_cache: Option<String>,
-    pub retrieval_strength: f64,
-    pub tags: Vec<String>,
+    pub id: String,                       // r.get(0) — UUID v7
+    pub kind: String,                     // r.get(1)
+    pub created_at: String,               // r.get(2)
+    pub updated_at: String,               // r.get(3)
+    pub current_version: u32,             // r.get(4)
+    pub first_line_cache: Option<String>, // r.get(5)
+    pub retrieval_strength: f64,          // r.get(6)
+    pub tags: Vec<String>,                // tags_for() 後付け
+    pub uname: String,                    // r.get(7) — 末尾追加 (§5-2-3-18)
 }
 
 #[derive(Debug, Clone)]
 pub struct VersionRow {
-    pub entry_id: String,
-    pub version: u32,
-    pub body: String,
-    pub file_path: String,
-    pub kind: String,
-    pub ts: String,
+    pub entry_id: String,    // r.get(0) — UUID v7
+    pub version: u32,        // r.get(1)
+    pub body: String,        // r.get(2)
+    pub file_path: String,   // r.get(3)
+    pub kind: String,        // r.get(4)
+    pub ts: String,          // r.get(5)
+    pub uname: String,       // r.get(6)
+    pub seq_in_kind: String, // r.get(7)
 }
 
 impl Db {
@@ -94,24 +102,8 @@ impl Db {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         conn.execute_batch(SCHEMA_SQL)?;
-        // Idempotent migration: add retrieval_strength column to pre-existing DBs.
-        // PRAGMA table_info returns one row per column; column index 1 is the name.
-        // SQLite DEFAULT handling means no full row rewrite occurs; existing rows
-        // read back 1.0 transparently without blocking concurrent reads.
-        {
-            let mut stmt = conn.prepare("PRAGMA table_info(entries)")?;
-            let exists = stmt
-                .query_map([], |r| r.get::<_, String>(1))?
-                .filter_map(|x| x.ok())
-                .any(|name| name == "retrieval_strength");
-            if !exists {
-                conn.execute_batch(
-                    "ALTER TABLE entries ADD COLUMN retrieval_strength REAL NOT NULL DEFAULT 1.0",
-                )?;
-            }
-        }
         // Idempotent migration: add boost_factor column to pre-existing kinds tables.
-        // Same pattern as retrieval_strength above; existing rows read back 1.0 via DEFAULT.
+        // Existing rows read back 1.0 via DEFAULT.
         {
             let mut stmt = conn.prepare("PRAGMA table_info(kinds)")?;
             let exists = stmt
@@ -252,15 +244,17 @@ impl Db {
         Ok(out)
     }
 
-    /// Per-month / per-kind sequence number. Within a `YYYY-MM` window, returns `MAX(NNNNN) + 1`.
-    /// The id format `YYYY-MM_NNNNN` has a fixed 8-char prefix (`YYYY-MM_`).
+    /// Per-month / per-kind sequence number. Within a `YYYY-MM` window, returns `MAX(seq) + 1`.
+    ///
+    /// `seq_in_kind` format is `"YYYY-MM_NNNNNN"` (8-char prefix `"YYYY-MM_"`, then 6-digit seq).
+    /// `substr(seq_in_kind, 9)` extracts the 6-digit numeric suffix.
     pub fn next_seq(&self, kind: &str, year_month: &str) -> Result<u32> {
         let like = format!("{}_%", year_month);
         let max: Option<i64> = self
             .conn
             .query_row(
-                "SELECT MAX(CAST(substr(id, 9) AS INTEGER))
-                 FROM entries WHERE kind = ?1 AND id LIKE ?2",
+                "SELECT MAX(CAST(substr(seq_in_kind, 9) AS INTEGER))
+                 FROM entries WHERE kind = ?1 AND seq_in_kind LIKE ?2",
                 params![kind, like],
                 |r| r.get(0),
             )
@@ -275,53 +269,77 @@ impl Db {
     /// # Arguments
     /// - `tx`: the active transaction owned by the caller; this helper never
     ///   opens, commits, or rolls back a transaction.
-    /// - `id`: entry id
+    /// - `uuid`: UUID v7 string — stored as `entries.id` (primary key)
+    /// - `uname`: human-readable identifier `"{kind}/{seq_in_kind}"` — stored as `entries.uname`
     /// - `kind`: kind name (must already be registered)
+    /// - `seq_in_kind`: `"{ym}_{seq:06}"` — stored as `entries.seq_in_kind`
     /// - `created_at`: ISO 8601 timestamp string used for both `created_at` and
     ///   `updated_at` columns, and for the tag-history `ts` column.
     /// - `first_line`: optional summary extracted from the body
     /// - `tags`: slice of tag strings to associate with this entry
     ///
+    /// tags.entry_id and tag_history.entry_id store **uname** (no FK, human-readable history).
+    ///
     /// # Errors
     /// Returns `Err` if any SQLite operation fails; the caller's transaction is
     /// left intact so it can be rolled back by dropping it.
+    #[allow(clippy::too_many_arguments)]
     fn insert_entry_in_tx(
         &self,
         tx: &Transaction,
-        id: &str,
+        uuid: &str,
+        uname: &str,
         kind: &str,
+        seq_in_kind: &str,
         created_at: &str,
         first_line: Option<&str>,
         tags: &[String],
     ) -> Result<()> {
+        // 3-site sync (§5-2-3-4 / §5-2-3-11):
+        // DDL NOT NULL: id, uname, kind, seq_in_kind, created_at, updated_at
+        // VALUES:       ?1,  ?2,   ?3,   ?4,          ?5,         ?5
         tx.execute(
-            "INSERT INTO entries(id, kind, created_at, updated_at, current_version, first_line_cache)
-             VALUES (?1, ?2, ?3, ?3, 1, ?4)",
-            params![id, kind, created_at, first_line],
+            "INSERT INTO entries(id, uname, kind, seq_in_kind, created_at, updated_at, current_version, first_line_cache)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, 1, ?6)",
+            params![uuid, uname, kind, seq_in_kind, created_at, first_line],
         )?;
         for t in tags {
+            // tags.entry_id references entries(id) ON DELETE CASCADE — uses UUID
             tx.execute(
                 "INSERT OR IGNORE INTO tags(entry_id, tag) VALUES (?1, ?2)",
-                params![id, t],
+                params![uuid, t],
             )?;
+            // tag_history.entry_id is TEXT non-FK — stores uname for human readability
             tx.execute(
                 "INSERT INTO tag_history(entry_id, tag, op, ts) VALUES (?1, ?2, 'add', ?3)",
-                params![id, t, created_at],
+                params![uname, t, created_at],
             )?;
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_entry(
         &self,
-        id: &str,
+        uuid: &str,
+        uname: &str,
         kind: &str,
+        seq_in_kind: &str,
         created_at: &str,
         first_line: Option<&str>,
         tags: &[String],
     ) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        self.insert_entry_in_tx(&tx, id, kind, created_at, first_line, tags)?;
+        self.insert_entry_in_tx(
+            &tx,
+            uuid,
+            uname,
+            kind,
+            seq_in_kind,
+            created_at,
+            first_line,
+            tags,
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -378,13 +396,16 @@ impl Db {
 
     /// Atomically insert an entry and record the version with body in the DB.
     ///
+    /// Generates a UUID v7 internally. Returns the generated uname on success.
+    ///
     /// `body` is stored directly in `versions.body` (DB SoT). Filesystem
     /// projection is written by the caller after this call returns successfully.
     /// The transaction is scoped to DB only; no filesystem I/O occurs here.
     ///
     /// # Arguments
-    /// - `id`: entry id
+    /// - `uname`: human-readable identifier `"{kind}/{seq_in_kind}"`
     /// - `kind`: kind name (must already be registered)
+    /// - `seq_in_kind`: `"{ym}_{seq:06}"`
     /// - `created_at`: ISO 8601 timestamp string
     /// - `first_line`: optional summary extracted from body
     /// - `tags`: slice of tag strings to associate
@@ -392,33 +413,50 @@ impl Db {
     /// - `file_path`: relative path hint for the FS projection
     /// - `body`: full entry body text (stored as DB SoT)
     ///
+    /// versions.entry_id stores UUID (FK to entries.id ON DELETE CASCADE — CRUX-2).
+    /// tags.entry_id stores UUID; tag_history.entry_id stores uname (TEXT non-FK).
+    ///
     /// # Errors
     /// Returns `Err` if any DB operation fails; the transaction is rolled back automatically.
     #[allow(clippy::too_many_arguments)]
     pub fn say_atomic(
         &self,
-        id: &str,
+        uname: &str,
         kind: &str,
+        seq_in_kind: &str,
         created_at: &str,
         first_line: Option<&str>,
         tags: &[String],
         version: u32,
         file_path: &str,
         body: &str,
-    ) -> Result<()> {
+    ) -> Result<String> {
+        let uuid = Uuid::now_v7().to_string();
         let tx = self.conn.unchecked_transaction()?;
-        self.insert_entry_in_tx(&tx, id, kind, created_at, first_line, tags)?;
-        self.add_version_in_tx(&tx, id, version, body, file_path, created_at)?;
+        self.insert_entry_in_tx(
+            &tx,
+            &uuid,
+            uname,
+            kind,
+            seq_in_kind,
+            created_at,
+            first_line,
+            tags,
+        )?;
+        // versions.entry_id = UUID (FK constraint, CRUX-2)
+        self.add_version_in_tx(&tx, &uuid, version, body, file_path, created_at)?;
         tx.commit()?;
-        Ok(())
+        Ok(uuid)
     }
 
     pub fn get_entry(&self, id: &str) -> Result<Option<EntryMetaRow>> {
         let row = self
             .conn
             .query_row(
+                // SELECT index: 0=id, 1=kind, 2=created_at, 3=updated_at, 4=current_version,
+                //               5=first_line_cache, 6=retrieval_strength, 7=uname (末尾)
                 "SELECT id, kind, created_at, updated_at, current_version, first_line_cache,
-                        retrieval_strength
+                        retrieval_strength, uname
                  FROM entries WHERE id = ?1",
                 params![id],
                 |r| {
@@ -431,6 +469,39 @@ impl Db {
                         first_line_cache: r.get(5)?,
                         retrieval_strength: r.get(6)?,
                         tags: vec![],
+                        uname: r.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(mut row) = row else { return Ok(None) };
+        row.tags = self.tags_for(&row.id)?;
+        Ok(Some(row))
+    }
+
+    /// Look up an entry by its uname (`"{kind}/{seq_in_kind}"`).
+    ///
+    /// Returns `Ok(Some(row))` if found, `Ok(None)` if not found.
+    /// Used by the journal layer as the primary surface lookup (CRUX-3).
+    pub fn get_entry_by_uname(&self, uname: &str) -> Result<Option<EntryMetaRow>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, kind, created_at, updated_at, current_version, first_line_cache,
+                        retrieval_strength, uname
+                 FROM entries WHERE uname = ?1",
+                params![uname],
+                |r| {
+                    Ok(EntryMetaRow {
+                        id: r.get(0)?,
+                        kind: r.get(1)?,
+                        created_at: r.get(2)?,
+                        updated_at: r.get(3)?,
+                        current_version: r.get::<_, i64>(4)? as u32,
+                        first_line_cache: r.get(5)?,
+                        retrieval_strength: r.get(6)?,
+                        tags: vec![],
+                        uname: r.get(7)?,
                     })
                 },
             )
@@ -487,8 +558,10 @@ impl Db {
 
     pub fn query_latest(&self, kind: &str, n: usize) -> Result<Vec<EntryMetaRow>> {
         let mut stmt = self.conn.prepare(
+            // SELECT index: 0=id, 1=kind, 2=created_at, 3=updated_at, 4=current_version,
+            //               5=first_line_cache, 6=retrieval_strength, 7=uname (末尾)
             "SELECT id, kind, created_at, updated_at, current_version, first_line_cache,
-                    retrieval_strength
+                    retrieval_strength, uname
              FROM entries WHERE kind = ?1 ORDER BY created_at DESC LIMIT ?2",
         )?;
         let rows = stmt
@@ -502,6 +575,7 @@ impl Db {
                     first_line_cache: r.get(5)?,
                     retrieval_strength: r.get(6)?,
                     tags: vec![],
+                    uname: r.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -540,9 +614,11 @@ impl Db {
         now_iso: &str,
     ) -> Result<Vec<EntryMetaRow>> {
         let mut stmt = self.conn.prepare(
+            // SELECT index: 0=id, 1=kind, 2=created_at, 3=updated_at, 4=current_version,
+            //               5=first_line_cache, 6=retrieval_strength, 7=uname (末尾)
             // score = retrieval_strength * boost_factor * decay_weight * exp(-ln(2) * age_days / half_life)
             "SELECT e.id, e.kind, e.created_at, e.updated_at, e.current_version, e.first_line_cache,
-                    e.retrieval_strength
+                    e.retrieval_strength, e.uname
              FROM entries e
              JOIN kinds k ON e.kind = k.name
              WHERE e.kind = ?1
@@ -560,6 +636,7 @@ impl Db {
                     first_line_cache: r.get(5)?,
                     retrieval_strength: r.get(6)?,
                     tags: vec![],
+                    uname: r.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -599,7 +676,10 @@ impl Db {
     /// Returns `Err` if a SQLite error occurs.
     pub fn list_all_versions(&self) -> Result<Vec<VersionRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT v.entry_id, v.version, v.body, v.file_path, e.kind, v.ts
+            // SELECT index: 0=entry_id(UUID), 1=version, 2=body, 3=file_path,
+            //               4=kind, 5=ts, 6=uname(末尾), 7=seq_in_kind(末尾)
+            "SELECT v.entry_id, v.version, v.body, v.file_path, e.kind, v.ts,
+                    e.uname, e.seq_in_kind
              FROM versions v
              JOIN entries e ON e.id = v.entry_id
              ORDER BY v.entry_id, v.version",
@@ -613,6 +693,8 @@ impl Db {
                     file_path: r.get(3)?,
                     kind: r.get(4)?,
                     ts: r.get(5)?,
+                    uname: r.get(6)?,
+                    seq_in_kind: r.get(7)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -622,7 +704,7 @@ impl Db {
     /// Set the `retrieval_strength` for the entry with the given `id`.
     ///
     /// # Arguments
-    /// - `id`: entry identifier (text id, e.g. `"2024-01_00001"`)
+    /// - `id`: entry identifier (UUID v7 string, internal)
     /// - `value`: new retrieval strength; must be pre-validated by the caller
     ///   (see `Journal::set_retrieval_strength` for the validation gate)
     ///
@@ -646,7 +728,7 @@ impl Db {
     /// Get the `retrieval_strength` for the entry with the given `id`.
     ///
     /// # Arguments
-    /// - `id`: entry identifier (text id, e.g. `"2024-01_00001"`)
+    /// - `id`: entry identifier (UUID v7 string, internal)
     ///
     /// # Returns
     /// `Ok(value)` with the current retrieval strength.
@@ -706,10 +788,13 @@ impl Db {
         now_iso: &str,
     ) -> Result<Vec<(EntryMetaRow, f64)>> {
         let mut stmt = self.conn.prepare(
+            // SELECT index: 0=id, 1=kind, 2=created_at, 3=updated_at, 4=current_version,
+            //               5=first_line_cache, 6=retrieval_strength, 7=score, 8=uname (末尾)
             // score = retrieval_strength * boost_factor * decay_weight * exp(-ln(2) * age_days / half_life)
             "SELECT e.id, e.kind, e.created_at, e.updated_at, e.current_version, e.first_line_cache,
                     e.retrieval_strength,
-                    (e.retrieval_strength * k.boost_factor * k.decay_weight * exp(-0.6931471805599453 * (julianday(?2) - julianday(e.created_at)) / k.decay_half_life)) AS score
+                    (e.retrieval_strength * k.boost_factor * k.decay_weight * exp(-0.6931471805599453 * (julianday(?2) - julianday(e.created_at)) / k.decay_half_life)) AS score,
+                    e.uname
              FROM entries e
              JOIN kinds k ON e.kind = k.name
              WHERE e.kind = ?1
@@ -728,6 +813,7 @@ impl Db {
                         first_line_cache: r.get(5)?,
                         retrieval_strength: r.get(6)?,
                         tags: vec![],
+                        uname: r.get(8)?,
                     },
                     r.get::<_, f64>(7)?,
                 ))
@@ -744,15 +830,27 @@ impl Db {
 
 #[cfg(test)]
 impl Db {
-    /// Test-only: overwrite `created_at` for an entry via the existing connection.
+    /// Test-only: overwrite `created_at` for an entry by UUID via the existing connection.
     ///
-    /// Use this in tests to simulate aged entries without spawning a second connection
-    /// (which could conflict with the process-global db_cache).
+    /// Internal implementation helper used by `set_created_at_for_test_by_uname`.
+    /// Also available for internal test use when UUID is already known.
     pub(crate) fn set_created_at_for_test(&self, id: &str, ts: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE entries SET created_at = ?1 WHERE id = ?2",
             params![ts, id],
         )?;
         Ok(())
+    }
+
+    /// Test-only: overwrite `created_at` for an entry identified by **uname**.
+    ///
+    /// Resolves the uname to a UUID via `get_entry_by_uname`, then delegates to
+    /// `set_created_at_for_test`. This keeps test surfaces uname-only (CRUX-3 test surface).
+    #[allow(dead_code)]
+    pub(crate) fn set_created_at_for_test_by_uname(&self, uname: &str, ts: &str) -> Result<()> {
+        let meta = self
+            .get_entry_by_uname(uname)?
+            .ok_or_else(|| crate::error::Error::EntryNotFound(uname.to_string()))?;
+        self.set_created_at_for_test(&meta.id, ts)
     }
 }

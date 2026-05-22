@@ -37,7 +37,7 @@ pub fn render_root_index(db: &Db, persona: &str, now_iso: &str) -> Result<String
                 .as_deref()
                 .map(|s| format!(" — {}", s))
                 .unwrap_or_default();
-            let _ = writeln!(out, "- {}{}{}", r.id, tag_part, summary);
+            let _ = writeln!(out, "- {}{}{}", r.uname, tag_part, summary);
         }
         let _ = writeln!(out);
     }

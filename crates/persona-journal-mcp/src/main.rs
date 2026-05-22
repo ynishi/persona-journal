@@ -234,9 +234,7 @@ async fn main() -> Result<()> {
             let summary = run_import_fs(&j, &persona, &kind, &source, force_override, dry_run)?;
 
             if !summary.conflicts.is_empty() {
-                println!(
-                    "conflicts (DB already has these ids, no write performed for these):"
-                );
+                println!("conflicts (DB already has these ids, no write performed for these):");
                 for id in &summary.conflicts {
                     println!("  {id}");
                 }
@@ -268,7 +266,10 @@ mod tests {
 
     #[test]
     fn parse_entry_filename_accepts_canonical_shape() {
-        assert_eq!(parse_entry_filename("2024-08_00012.md"), Some((2024, 8, 12)));
+        assert_eq!(
+            parse_entry_filename("2024-08_00012.md"),
+            Some((2024, 8, 12))
+        );
         assert_eq!(parse_entry_filename("2024-01_00001.md"), Some((2024, 1, 1)));
         assert_eq!(
             parse_entry_filename("2099-12_99999.md"),
@@ -308,8 +309,7 @@ mod tests {
         let j = Journal::open(root.clone());
         j.ensure_default_kinds("shi").unwrap();
 
-        let summary =
-            run_import_fs(&j, "shi", "emo", &src, false, true).unwrap();
+        let summary = run_import_fs(&j, "shi", "emo", &src, false, true).unwrap();
         assert_eq!(summary.matched, 2);
         assert_eq!(summary.written, 2);
         assert_eq!(summary.skipped, 2); // _index.md + README.md
@@ -338,10 +338,10 @@ mod tests {
         // Second run with same input: 1 conflict, 0 written.
         let s2 = run_import_fs(&j, "shi", "emo", &src, false, false).unwrap();
         assert_eq!(s2.written, 0);
-        assert_eq!(s2.conflicts, vec!["2024-08_00001".to_string()]);
+        assert_eq!(s2.conflicts, vec!["emo/2024-08_000001".to_string()]);
 
         // Body unchanged.
-        let body = j.entry_read("shi", "2024-08_00001", None).unwrap();
+        let body = j.entry_read("shi", "emo/2024-08_000001", None).unwrap();
         assert!(body.contains("first body"));
 
         // Third run with --force-override: 1 written (v2), 0 conflicts.
@@ -349,7 +349,7 @@ mod tests {
         let s3 = run_import_fs(&j, "shi", "emo", &src, true, false).unwrap();
         assert_eq!(s3.written, 1);
         assert!(s3.conflicts.is_empty());
-        let body = j.entry_read("shi", "2024-08_00001", None).unwrap();
+        let body = j.entry_read("shi", "emo/2024-08_000001", None).unwrap();
         assert!(body.contains("second body"));
     }
 }
