@@ -4,6 +4,47 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Changed
+
+- **`entries` schema full redesign — UUID v7 primary key + `uname` first-class identifier.**
+  - `entries.id` is now a UUID v7 TEXT (`Uuid::now_v7()` from the `uuid` crate, `features = ["v7"]`).
+  - `entries.uname TEXT NOT NULL UNIQUE` added — format `{kind}/{ym}_{seq:06}` (e.g. `emo/2024-08_000001`). `uname` is the sole externally visible entry identifier across all MCP tools, CLI commands, and public library functions. UUID is internal only.
+  - `entries.kind TEXT NOT NULL` + `entries.seq_in_kind TEXT NOT NULL` added. A `UNIQUE INDEX` on `(kind, seq_in_kind)` enforces kind-scoped uniqueness. A `CHECK(uname = kind || '/' || seq_in_kind)` constraint in the DDL guarantees structural integrity at the database level.
+  - `tags` and `versions` table foreign keys remain `entries.id` (UUID) `ON DELETE CASCADE`. `tag_history.entry_id` remains a non-CASCADE TEXT reference (stores `uname` for human readability). The two-scheme split is preserved by design.
+  - Sequence digits increased from 5 to 6 (`%05` → `%06`).
+
+- **`persona-journal-core::storage` helpers refactored.**
+  - `entry_id(year, month, seq)` removed. Replaced by two focused helpers:
+    - `pub fn seq_in_kind_str(year_month: &str, seq: u32) -> String` — constructs `{ym}_{seq:06}`.
+    - `pub fn uname(kind: &str, seq_in_kind: &str) -> String` — constructs `{kind}/{seq_in_kind}`.
+  - `flat_path` and `versioned_path` updated to the new path layout: `<persona>/<kind>/<seq_in_kind>.md` (flat) and `<persona>/<kind>/<seq_in_kind>/<seq_in_kind>_vN.md` (versioned).
+
+- **`Journal::say` return value** — now returns the `uname` string (e.g. `"emo/2024-08_000001"`) instead of the old `"YYYY-MM_NNNNN"` format. UUID is generated internally and never returned.
+
+- **`Db::get_entry_by_uname(uname: &str) -> Result<Option<EntryMetaRow>>`** — new method for surface-level entry lookup by uname. The existing `get_entry(uuid)` is retained as an internal join helper.
+
+- **`Journal::entry_read`, `set_retrieval_strength`, `pin`, `unpin`** — all accept `uname` as the entry identifier. Internal UUID resolution happens inside the journal layer via `get_entry_by_uname`.
+
+- **`Journal::projection_rebuild`** — updated to use `uname` / `seq_in_kind` for path construction. `list_all_versions` now JOINs `entries` to return `uname` and `seq_in_kind` in a single query.
+
+- **MCP tool `journal_say` response** — `id` field now contains `uname` (e.g. `"emo/2024-08_000001"`).
+
+- **MCP tool `journal_entry_read`, `journal_query_latest`** — `id` field in returned rows contains `uname`.
+
+- **`#[cfg(test)]` helper `set_created_at_for_test_by_uname(uname: &str, ts: &str)`** added to `db.rs`. Resolves UUID internally via `get_entry_by_uname`; test code never handles raw UUIDs. The underlying `set_created_at_for_test(uuid, ts)` is retained as a private impl helper.
+
+- **All 82 `#[test]` cases** updated: old-format id strings (`"2024-08_00001"`) replaced with uname-format strings (`"emo/2024-08_000001"`); all `set_created_at_for_test` call sites replaced with `set_created_at_for_test_by_uname`.
+
+- **`crates/persona-journal-mcp` E2E MCP tests** — `journal_say` id-format assertions updated to validate uname format.
+
+### Removed
+
+- **`Journal::import_entry`** — removed. The `ImportFs` CLI subcommand (`persona-journal-mcp import-fs`), `parse_entry_filename`, and the three associated tests in `mcp/main.rs` are also removed. Use the standalone `persona-journal-migrate` tooling for FS→DB imports.
+
+- **`crate::error::Error::AlreadyExists`** variant — removed. All callers were exclusive to `import_entry` and `ImportFs`; with those removed, the variant had no remaining callers.
+
 ## [0.1.0] - 2026-05-21
 
 ### Added
