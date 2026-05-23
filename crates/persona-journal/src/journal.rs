@@ -513,6 +513,86 @@ impl Journal {
         Ok(entry_uname)
     }
 
+    /// Append a new row to a `NamedIndex`-mode kind. Returns the generated `uname`.
+    ///
+    /// # Arguments
+    /// - `persona` — persona name (e.g. `"alice"`)
+    /// - `kind` — kind name (e.g. `"archive"`); must be a `NamedIndex`-mode kind
+    /// - `name` — row label stored in `entries.first_line_cache` (not a unique key; duplicates allowed)
+    /// - `body` — row body text stored in `versions.body`
+    ///
+    /// # Returns
+    /// `Ok(uname)` where `uname` is `"<kind>/<YYYY-MM_NNNNNN>"`, auto-sequenced per `(kind, year_month)`.
+    ///
+    /// # Errors
+    /// - `Error::UnknownKind` — `kind` is not registered for `persona`
+    /// - `Error::Invalid` — `kind` is not in `NamedIndex` mode, or the db lock is poisoned
+    /// - `Error::Sqlite` / `Error::Io` — DB or filesystem failure
+    ///
+    /// # Concurrency
+    /// Same lock discipline as `say()`: outer `Mutex<HashMap>` released before returning
+    /// `Arc<Mutex<Db>>`, inner `Mutex<Db>` released before this function returns.
+    /// Concurrent calls for the same persona serialize at the inner lock.
+    pub fn append_named_index(
+        &self,
+        persona: &str,
+        kind: &str,
+        name: &str,
+        body: &str,
+    ) -> Result<String> {
+        let db_arc = self.open_db(persona)?;
+        let db = db_arc
+            .lock()
+            .map_err(|e| Error::Invalid(format!("db lock poisoned: {e}")))?;
+        let kind_cfg = db
+            .get_kind(kind)?
+            .ok_or_else(|| Error::UnknownKind(kind.to_string()))?;
+        if !matches!(kind_cfg.mode, KindMode::NamedIndex) {
+            return Err(Error::Invalid(
+                "append_named_index supports named_index mode only".to_string(),
+            ));
+        }
+
+        let now = OffsetDateTime::now_utc();
+        let now_iso = now
+            .format(&Rfc3339)
+            .map_err(|e| Error::Invalid(e.to_string()))?;
+        let ym = format!("{:04}-{:02}", now.year(), u8::from(now.month()));
+        let seq = db.next_seq(kind, &ym)?;
+        let seq_in_kind = seq_in_kind_str(&ym, seq);
+        let entry_uname = make_uname(kind, &seq_in_kind);
+
+        let path = if kind_cfg.versioning {
+            versioned_path(&self.root, persona, kind, &seq_in_kind, 1)
+        } else {
+            flat_path(&self.root, persona, kind, &seq_in_kind)
+        };
+        let rel = path
+            .strip_prefix(&self.root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| path.to_string_lossy().into_owned());
+
+        db.say_atomic(
+            &entry_uname,
+            kind,
+            &seq_in_kind,
+            &now_iso,
+            Some(name), // NamedIndex: name stored directly, no extract_first_line
+            &[],        // tags: empty for this scope; extend in a future issue if needed
+            1,
+            &rel,
+            body,
+        )?;
+
+        // Projection is best-effort; failures do not roll back the committed entry.
+        self.project_entry_file_best_effort(&path, body);
+        if kind_cfg.indexed {
+            self.project_index_best_effort(&db, persona, &now_iso);
+        }
+
+        Ok(entry_uname)
+    }
+
     /// Import a legacy FS entry into the journal under the new UUID v7 + uname schema.
     ///
     /// # Arguments
@@ -3664,5 +3744,72 @@ tags = []
             ),
             other => panic!("expected Error::Invalid, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn append_named_index_inserts_row_with_name_in_first_line_cache() {
+        use crate::schema::KindConfig;
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        let persona = "alice";
+        j.kind_register(persona, &KindConfig::preset_archive())
+            .unwrap();
+
+        let uname = j
+            .append_named_index(persona, "archive", "first-line-summary", "full body text")
+            .unwrap();
+
+        assert!(
+            uname.starts_with("archive/"),
+            "uname must start with kind: {uname}"
+        );
+
+        let rows = j.query_latest(persona, "archive", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary.as_deref(), Some("first-line-summary"));
+
+        let body = j.entry_read(persona, &uname, None).unwrap();
+        assert!(body.contains("full body text"));
+    }
+
+    #[test]
+    fn append_named_index_rejects_entries_mode() {
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        j.ensure_default_kinds("shi").unwrap(); // emo (entries) is registered
+
+        let err = j.append_named_index("shi", "emo", "x", "body").unwrap_err();
+
+        match err {
+            Error::Invalid(msg) => assert!(
+                msg.contains("named_index mode only"),
+                "msg must mention named_index mode only: {msg}"
+            ),
+            other => panic!("expected Error::Invalid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn append_named_index_allows_duplicate_name() {
+        use crate::schema::KindConfig;
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        let persona = "alice";
+        j.kind_register(persona, &KindConfig::preset_archive())
+            .unwrap();
+
+        let u1 = j
+            .append_named_index(persona, "archive", "same-name", "body 1")
+            .unwrap();
+        let u2 = j
+            .append_named_index(persona, "archive", "same-name", "body 2")
+            .unwrap();
+        assert_ne!(
+            u1, u2,
+            "duplicate name must produce distinct unames: {u1} vs {u2}"
+        );
+
+        let rows = j.query_latest(persona, "archive", 10).unwrap();
+        assert_eq!(rows.len(), 2, "both rows must be inserted");
     }
 }
