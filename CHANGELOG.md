@@ -14,6 +14,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - **`Cmd::ImportFs` CLI subcommand re-added** — `persona-journal-mcp import-fs <persona> <kind> <source> [--force-override] [--dry-run]` is available again. `parse_entry_filename` helper parses `YYYY-MM_NNNNN.md` filenames to `(year, month, seq)` numerically (no string padding in the CLI layer). `run_import_fs` handler dispatches to `Journal::import_entry`; on `Error::AlreadyExists` the entry is recorded in the conflict column; other errors emit `tracing::warn!` and are recorded in the error column. `--dry-run` performs all parsing and existence checks without writing. Unit tests in `main.rs`: filename parse OK / parse error / dry-run does not write / real → conflict → force-override sequence.
 
+### Fixed
+
+- **Deterministic query ordering via `seq_in_kind DESC` tie-breaker** — All three retrieval queries in `Db` (`query_latest`, `query_by_retrieval`, `query_by_retrieval_with_scores`) now append `seq_in_kind DESC` as the final `ORDER BY` key. Previously, rows sharing identical `created_at` (and identical `retrieval_strength` for the retrieval queries) were returned in undefined SQLite rowid order, which is not stable across `VACUUM` or concurrent writes. The fix uses the existing `(kind, seq_in_kind)` unique index as the tie-breaker source; the zero-padded `YYYY-MM_NNNNNN` format guarantees that lexicographic descending order equals insertion-sequence descending order within the same month. No schema change, no API surface change. Three new unit tests verify that, given three entries with identical `created_at` and `retrieval_strength`, each query returns them in `seq_in_kind DESC` order exactly.
+
 ### Changed
 
 - **`entries` schema full redesign — UUID v7 primary key + `uname` first-class identifier.**
