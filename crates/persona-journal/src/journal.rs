@@ -1961,6 +1961,230 @@ tags = []
         );
     }
 
+    /// Verify that `query_latest` breaks ties in `created_at` by `seq_in_kind DESC`.
+    ///
+    /// # Setup
+    /// Three entries are created in sequence (seq 000001 → 000002 → 000003) and then all
+    /// have their `created_at` overwritten with the same timestamp, creating a complete tie.
+    ///
+    /// # Expected
+    /// The entry with the highest `seq_in_kind` (000003) must appear first, confirming that
+    /// the tie-breaker `seq_in_kind DESC` produces deterministic ordering regardless of SQLite
+    /// rowid or insertion order.
+    ///
+    /// # Crux constraint
+    /// Satisfies `UT asserts deterministic seq-DESC order`: ≥3 rows, identical `created_at`,
+    /// returned order matches `seq_in_kind` descending exactly.
+    #[test]
+    fn query_latest_tie_breaks_by_seq_desc() {
+        use crate::schema::{DecayConfig, KindConfig, KindMode};
+
+        let tmp = TempDir::new().unwrap();
+        let persona = "alice";
+        let kind = "test_latest_tie";
+
+        let j = Journal::open(tmp.path().to_path_buf());
+
+        let cfg = KindConfig {
+            kind: kind.to_string(),
+            mode: KindMode::Entries,
+            source: None,
+            path_template: "{persona}/{kind}/{persona}_{kind}_{yyyy}-{mm}_{seq:05}.md".to_string(),
+            versioning: true,
+            indexed: true,
+            decay: DecayConfig {
+                half_life_days: 1.0,
+                weight: 1.0,
+            },
+            boost_factor: 1.0,
+            tags: vec![],
+            body_template: None,
+            config_toml: String::new(),
+        };
+        j.kind_register(persona, &cfg).unwrap();
+
+        // Create 3 entries in ascending seq order (000001, 000002, 000003).
+        let uname_1 = j.say(persona, kind, "# entry 1", vec![]).unwrap();
+        let uname_2 = j.say(persona, kind, "# entry 2", vec![]).unwrap();
+        let uname_3 = j.say(persona, kind, "# entry 3", vec![]).unwrap();
+
+        // Force all three to the same created_at to create a complete tie.
+        let same_ts = "2026-05-01T00:00:00Z";
+        let db_arc = j.open_db(persona).unwrap();
+        {
+            let db = db_arc.lock().unwrap();
+            // SAFETY: test-only helper; no panic path since uname comes from j.say above.
+            db.set_created_at_for_test_by_uname(&uname_1, same_ts)
+                .unwrap();
+            db.set_created_at_for_test_by_uname(&uname_2, same_ts)
+                .unwrap();
+            db.set_created_at_for_test_by_uname(&uname_3, same_ts)
+                .unwrap();
+        }
+
+        // seq_in_kind DESC: uname_3 (000003) must come first, uname_1 (000001) last.
+        let rows = j.query_latest(persona, kind, 10).unwrap();
+        assert_eq!(rows.len(), 3, "expected 3 rows");
+        assert_eq!(rows[0].uname, uname_3, "newest seq must come first");
+        assert_eq!(rows[1].uname, uname_2, "middle seq must come second");
+        assert_eq!(rows[2].uname, uname_1, "oldest seq must come last");
+    }
+
+    /// Verify that `query_by_retrieval` breaks ties in decay score by `seq_in_kind DESC`.
+    ///
+    /// # Setup
+    /// Three entries are created in sequence and all have their `created_at` overwritten with
+    /// the same timestamp.  All three are also explicitly set to `retrieval_strength = 1.0`
+    /// so the decay formula yields identical scores, creating a complete tie.
+    ///
+    /// # Expected
+    /// The entry with the highest `seq_in_kind` (000003) must appear first.
+    ///
+    /// # Crux constraint
+    /// Satisfies `UT asserts deterministic seq-DESC order`: ≥3 rows, identical `created_at`
+    /// and `retrieval_strength`, returned order matches `seq_in_kind` descending exactly.
+    #[test]
+    fn query_by_retrieval_tie_breaks_by_seq_desc() {
+        use crate::schema::{DecayConfig, KindConfig, KindMode};
+
+        let tmp = TempDir::new().unwrap();
+        let persona = "alice";
+        let kind = "test_retrieval_tie";
+
+        let j = Journal::open(tmp.path().to_path_buf());
+
+        let cfg = KindConfig {
+            kind: kind.to_string(),
+            mode: KindMode::Entries,
+            source: None,
+            path_template: "{persona}/{kind}/{persona}_{kind}_{yyyy}-{mm}_{seq:05}.md".to_string(),
+            versioning: true,
+            indexed: true,
+            decay: DecayConfig {
+                half_life_days: 1.0,
+                weight: 1.0,
+            },
+            boost_factor: 1.0,
+            tags: vec![],
+            body_template: None,
+            config_toml: String::new(),
+        };
+        j.kind_register(persona, &cfg).unwrap();
+
+        // Create 3 entries in ascending seq order (000001, 000002, 000003).
+        let uname_1 = j.say(persona, kind, "# entry 1", vec![]).unwrap();
+        let uname_2 = j.say(persona, kind, "# entry 2", vec![]).unwrap();
+        let uname_3 = j.say(persona, kind, "# entry 3", vec![]).unwrap();
+
+        // Explicitly set retrieval_strength = 1.0 on all three to make the tie contract
+        // explicit (say() defaults to 1.0, but this makes it a stated contract in the test).
+        j.set_retrieval_strength(persona, &uname_1, 1.0).unwrap();
+        j.set_retrieval_strength(persona, &uname_2, 1.0).unwrap();
+        j.set_retrieval_strength(persona, &uname_3, 1.0).unwrap();
+
+        // Force all three to the same created_at to create a complete decay-score tie.
+        let same_ts = "2026-05-01T00:00:00Z";
+        let db_arc = j.open_db(persona).unwrap();
+        {
+            let db = db_arc.lock().unwrap();
+            // SAFETY: test-only helper; no panic path since uname comes from j.say above.
+            db.set_created_at_for_test_by_uname(&uname_1, same_ts)
+                .unwrap();
+            db.set_created_at_for_test_by_uname(&uname_2, same_ts)
+                .unwrap();
+            db.set_created_at_for_test_by_uname(&uname_3, same_ts)
+                .unwrap();
+        }
+
+        // seq_in_kind DESC: uname_3 (000003) must come first, uname_1 (000001) last.
+        let now = OffsetDateTime::now_utc();
+        let rows = j.query_by_retrieval(persona, kind, 10, now).unwrap();
+        assert_eq!(rows.len(), 3, "expected 3 rows");
+        assert_eq!(rows[0].uname, uname_3, "newest seq must come first");
+        assert_eq!(rows[1].uname, uname_2, "middle seq must come second");
+        assert_eq!(rows[2].uname, uname_1, "oldest seq must come last");
+    }
+
+    /// Verify that `query_by_retrieval_with_scores` breaks ties in decay score by `seq_in_kind DESC`.
+    ///
+    /// # Setup
+    /// Three entries are created in sequence and all have their `created_at` overwritten with
+    /// the same timestamp and `retrieval_strength` explicitly set to 1.0, creating identical
+    /// decay scores.
+    ///
+    /// # Expected
+    /// The entry with the highest `seq_in_kind` (000003) must appear first.  Each tuple
+    /// element is `(EntryMetaRow, f64)`, so ordering is checked via `.0.uname`.
+    ///
+    /// # Crux constraint
+    /// Satisfies `UT asserts deterministic seq-DESC order`: ≥3 rows, identical `created_at`
+    /// and `retrieval_strength`, returned order matches `seq_in_kind` descending exactly.
+    #[test]
+    fn query_by_retrieval_with_scores_tie_breaks_by_seq_desc() {
+        use crate::schema::{DecayConfig, KindConfig, KindMode};
+
+        let tmp = TempDir::new().unwrap();
+        let persona = "alice";
+        let kind = "test_scores_tie";
+
+        let j = Journal::open(tmp.path().to_path_buf());
+
+        let cfg = KindConfig {
+            kind: kind.to_string(),
+            mode: KindMode::Entries,
+            source: None,
+            path_template: "{persona}/{kind}/{persona}_{kind}_{yyyy}-{mm}_{seq:05}.md".to_string(),
+            versioning: true,
+            indexed: true,
+            decay: DecayConfig {
+                half_life_days: 1.0,
+                weight: 1.0,
+            },
+            boost_factor: 1.0,
+            tags: vec![],
+            body_template: None,
+            config_toml: String::new(),
+        };
+        j.kind_register(persona, &cfg).unwrap();
+
+        // Create 3 entries in ascending seq order (000001, 000002, 000003).
+        let uname_1 = j.say(persona, kind, "# entry 1", vec![]).unwrap();
+        let uname_2 = j.say(persona, kind, "# entry 2", vec![]).unwrap();
+        let uname_3 = j.say(persona, kind, "# entry 3", vec![]).unwrap();
+
+        // Explicitly set retrieval_strength = 1.0 to make the tie contract explicit.
+        j.set_retrieval_strength(persona, &uname_1, 1.0).unwrap();
+        j.set_retrieval_strength(persona, &uname_2, 1.0).unwrap();
+        j.set_retrieval_strength(persona, &uname_3, 1.0).unwrap();
+
+        // Force all three to the same created_at to create a complete decay-score tie.
+        let same_ts = "2026-05-01T00:00:00Z";
+        let db_arc = j.open_db(persona).unwrap();
+        {
+            let db = db_arc.lock().unwrap();
+            // SAFETY: test-only helper; no panic path since uname comes from j.say above.
+            db.set_created_at_for_test_by_uname(&uname_1, same_ts)
+                .unwrap();
+            db.set_created_at_for_test_by_uname(&uname_2, same_ts)
+                .unwrap();
+            db.set_created_at_for_test_by_uname(&uname_3, same_ts)
+                .unwrap();
+        }
+
+        // Call pub(crate) fn directly via the locked Db (same pattern as L1941-L1944).
+        let now_iso = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
+        let db2 = db_arc.lock().unwrap();
+        let scored = db2
+            .query_by_retrieval_with_scores(kind, 10, &now_iso)
+            .unwrap();
+
+        // seq_in_kind DESC: uname_3 (000003) must come first, uname_1 (000001) last.
+        assert_eq!(scored.len(), 3, "expected 3 rows");
+        assert_eq!(scored[0].0.uname, uname_3, "newest seq must come first");
+        assert_eq!(scored[1].0.uname, uname_2, "middle seq must come second");
+        assert_eq!(scored[2].0.uname, uname_1, "oldest seq must come last");
+    }
+
     // ── query_by_retrieval 4-factor probe tests ──────────────────────────────
 
     /// Test #1: retrieval_strength influences ordering (higher strength → ranked first).
