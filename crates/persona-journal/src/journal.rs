@@ -209,6 +209,12 @@ impl Journal {
     /// - No `MutexGuard` is held across an `.await` point; safe to call from
     ///   an async context.
     ///
+    /// # Lookup order
+    /// 1. `<canonical_root>/<persona>/.journal.toml` (per-persona, wins if present)
+    /// 2. `<canonical_root>/.journal.toml` (root-level fallback for shared kind sets)
+    ///
+    /// Both absent → `Ok(0)` (silent skip).
+    ///
     /// # Errors
     /// Returns `Err` for I/O failure, TOML parse failure, lock poisoning, or DB
     /// errors.  `.journal.toml` absence is treated as `Ok(0)` (silent skip).
@@ -242,16 +248,32 @@ impl Journal {
             crate::loader::load_counter_inc(&canonical_root, persona);
         }
 
-        let toml_path = canonical_root.join(persona).join(".journal.toml");
-        let src = match std::fs::read_to_string(&toml_path) {
-            Ok(s) => s,
+        // 2-tier lookup: per-persona toml wins, root-level toml is fallback.
+        // Shared kind set across multiple personas can be DRY'd at `<root>/.journal.toml`.
+        let per_persona_path = canonical_root.join(persona).join(".journal.toml");
+        let root_level_path = canonical_root.join(".journal.toml");
+        let (toml_path, src) = match std::fs::read_to_string(&per_persona_path) {
+            Ok(s) => (per_persona_path, s),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(0);
+                match std::fs::read_to_string(&root_level_path) {
+                    Ok(s) => (root_level_path, s),
+                    Err(e2) if e2.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(0);
+                    }
+                    Err(e2) => {
+                        tracing::warn!(
+                            ?e2,
+                            ?root_level_path,
+                            "load_journal_toml_kinds: failed to read root-level .journal.toml"
+                        );
+                        return Err(Error::Io(e2));
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(
                     ?e,
-                    ?toml_path,
+                    ?per_persona_path,
                     "load_journal_toml_kinds: failed to read .journal.toml"
                 );
                 return Err(Error::Io(e));
@@ -298,8 +320,10 @@ impl Journal {
     ///
     /// Slow-path (first call per persona): inserts the persona into `LOADED`
     /// before releasing the mutex, then reads and parses
-    /// `<canonical_root>/<persona>/.journal.toml`, then opens `Mutex<Db>` and
-    /// runs insert-if-absent upserts for each kind.
+    /// `<canonical_root>/<persona>/.journal.toml` (or, if absent,
+    /// `<canonical_root>/.journal.toml` as a root-level fallback for shared
+    /// kind sets), then opens `Mutex<Db>` and runs insert-if-absent upserts
+    /// for each kind.
     ///
     /// # Concurrency
     /// - `LOADED` Mutex is **never held while performing I/O or while holding
@@ -1700,6 +1724,92 @@ tags = []
         assert!(
             j.kind_get(persona, "new_kind").unwrap().is_some(),
             "new_kind should be present after reload"
+        );
+    }
+
+    // ── loader root-level fallback tests ─────────────────────────────────────
+
+    const JOURNAL_TOML_ROOT_KIND: &str = r#"
+[[kinds]]
+kind = "root_level_kind"
+mode = "entries"
+path_template = "{persona}/{kind}/{persona}_{kind}_{yyyy}-{mm}_{seq:05}.md"
+versioning = true
+indexed = true
+tags = ["from_root"]
+"#;
+
+    const JOURNAL_TOML_PER_PERSONA_KIND: &str = r#"
+[[kinds]]
+kind = "per_persona_kind"
+mode = "entries"
+path_template = "{persona}/{kind}/{persona}_{kind}_{yyyy}-{mm}_{seq:05}.md"
+versioning = true
+indexed = true
+tags = ["from_per_persona"]
+"#;
+
+    #[test]
+    fn test_loader_root_level_fallback_when_per_persona_missing() {
+        // Per-persona toml absent, root-level toml present → kinds load from root-level.
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(
+            tmp.path().join(".journal.toml"),
+            JOURNAL_TOML_ROOT_KIND.trim(),
+        )
+        .unwrap();
+
+        let j = Journal::open(tmp.path().to_path_buf());
+        let kinds = j.kind_list("shared_persona").unwrap();
+        let names: Vec<&str> = kinds.iter().map(|k| k.kind.as_str()).collect();
+        assert!(
+            names.contains(&"root_level_kind"),
+            "root_level_kind missing: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_loader_per_persona_wins_over_root_level() {
+        // Both per-persona and root-level toml exist → per-persona wins (root-level ignored).
+        let tmp = TempDir::new().unwrap();
+        let persona = "winning_persona";
+        let persona_dir = tmp.path().join(persona);
+        std::fs::create_dir_all(&persona_dir).unwrap();
+
+        std::fs::write(
+            tmp.path().join(".journal.toml"),
+            JOURNAL_TOML_ROOT_KIND.trim(),
+        )
+        .unwrap();
+        std::fs::write(
+            persona_dir.join(".journal.toml"),
+            JOURNAL_TOML_PER_PERSONA_KIND.trim(),
+        )
+        .unwrap();
+
+        let j = Journal::open(tmp.path().to_path_buf());
+        let kinds = j.kind_list(persona).unwrap();
+        let names: Vec<&str> = kinds.iter().map(|k| k.kind.as_str()).collect();
+        assert!(
+            names.contains(&"per_persona_kind"),
+            "per_persona_kind missing: {names:?}"
+        );
+        assert!(
+            !names.contains(&"root_level_kind"),
+            "root_level_kind should NOT be loaded when per-persona toml present: {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_loader_both_toml_absent_silent_skip() {
+        // Neither per-persona nor root-level toml exists → silent skip, no error.
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        // kind_list should succeed and be empty (no ensure_default_kinds invoked here).
+        let kinds = j.kind_list("orphan_persona").unwrap();
+        assert!(
+            kinds.is_empty(),
+            "no kinds should be loaded when both toml files are absent: {kinds:?}"
         );
     }
 
