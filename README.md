@@ -118,10 +118,15 @@ The same binary doubles as a CLI:
 ```sh
 persona-journal-mcp kind-list <persona>
 persona-journal-mcp projection-rebuild <persona>
-persona-journal-mcp import-fs <persona> <kind> <source-dir> [--force-override] [--dry-run]
+persona-journal-mcp import-fs <persona> <kind> <source> [--force-override] [--dry-run]
 ```
 
-`import-fs` walks `<source-dir>` for `YYYY-MM_NNNNN.md` files and imports them as `entries`-mode entries under the given persona and kind. `--force-override` appends a new version instead of returning a conflict error. `--dry-run` performs all parsing and existence checks without writing to the DB.
+`import-fs` behavior depends on the kind's mode:
+
+- **`entries` mode** — `<source>` is a directory. Walks it for `YYYY-MM_NNNNN.md` files and imports them via `Journal::import_entry`. `--force-override` appends a new version instead of returning a conflict error.
+- **`named_index` mode** — `<source>` is a file. Reads it line by line; blank lines and lines starting with `#` are skipped. Each remaining line is inserted as an independent row via `Journal::append_named_index`. `--force-override` is accepted but has no effect (auto-generated sequence never conflicts).
+
+`--dry-run` performs all parsing and existence checks without writing to the DB in both modes.
 
 (default subcommand is `mcp`, which serves over stdio.)
 
