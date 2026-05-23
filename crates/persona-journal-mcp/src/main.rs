@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use persona_journal::{Error as JournalError, Journal};
+use persona_journal::{Error as JournalError, Journal, KindMode};
 use persona_journal_mcp::JournalService;
 use rmcp::{transport::stdio, ServiceExt};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -26,7 +26,14 @@ enum Cmd {
     ProjectionRebuild { persona: String },
     /// List registered kinds for a persona.
     KindList { persona: String },
-    /// Import entries from a legacy FS directory (5-digit YYYY-MM_NNNNN.md filenames).
+    /// Import entries from FS into the journal.
+    ///
+    /// For entries-mode kinds: --source is a directory of legacy 5-digit
+    /// YYYY-MM_NNNNN.md files. --force_override re-imports as new versions.
+    ///
+    /// For named_index-mode kinds: --source is a single .md file. Each
+    /// non-empty, non-comment (#-prefix) line is inserted as one row.
+    /// --force_override has no effect (unames are always unique).
     ImportFs {
         #[arg(long)]
         persona: String,
@@ -93,24 +100,44 @@ fn parse_entry_filename(name: &str) -> Option<(i32, u8, u32)> {
     Some((year, month, seq))
 }
 
-/// Import entries from a legacy FS directory into the journal.
+/// Import entries from FS into the journal.
+///
+/// Dispatches to `run_import_fs_entries` (entries mode) or
+/// `run_import_fs_named_index` (named_index mode) based on the registered kind.
+///
+/// # Errors
+/// Returns `Err` for unrecoverable setup failures (kind lookup failure, source
+/// read failure). Per-item failures are accumulated in the returned summary.
+fn run_import_fs(
+    journal: &Journal,
+    persona: &str,
+    kind: &str,
+    source: &Path,
+    force_override: bool,
+    dry_run: bool,
+) -> anyhow::Result<ImportSummary> {
+    let kind_cfg = journal
+        .kind_get(persona, kind)?
+        .ok_or_else(|| anyhow::anyhow!("kind {} not registered for persona {}", kind, persona))?;
+
+    match kind_cfg.mode {
+        KindMode::Entries => {
+            run_import_fs_entries(journal, persona, kind, source, force_override, dry_run)
+        }
+        KindMode::NamedIndex => run_import_fs_named_index(journal, persona, kind, source, dry_run),
+    }
+}
+
+/// Import entries from a legacy FS directory (entries mode).
 ///
 /// Walks `source` for files matching `YYYY-MM_NNNNN.md`, reads their body,
 /// and calls `Journal::import_entry` for each one. Returns an `ImportSummary`
 /// with counts of matched / written / skipped / conflicted / errored files.
 ///
-/// # Arguments
-/// - `journal` — open `Journal` instance
-/// - `persona` — target persona
-/// - `kind` — entry kind (must be `entries` mode)
-/// - `source` — directory containing legacy `.md` files
-/// - `force_override` — if true, re-import conflicting entries as new versions
-/// - `dry_run` — if true, print what would be imported without writing to DB
-///
 /// # Errors
 /// Returns `Err` only for unrecoverable setup failures (e.g. `read_dir` on the
 /// source path). Per-file failures are accumulated in the returned summary.
-fn run_import_fs(
+fn run_import_fs_entries(
     journal: &Journal,
     persona: &str,
     kind: &str,
@@ -209,6 +236,65 @@ fn run_import_fs(
             }
             Err(e) => {
                 tracing::warn!(error=?e, path=%path.display(), "import failed");
+                summary.errors += 1;
+            }
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Import lines from a single file into a named_index-mode kind.
+///
+/// Reads `source` as a text file and iterates over lines. Blank lines and
+/// lines whose trimmed form starts with `#` are skipped. Each remaining line
+/// is inserted as one independent row via `Journal::append_named_index`.
+///
+/// `force_override` is accepted but ignored — unames are auto-sequenced and
+/// always unique for named_index kinds.
+///
+/// # Errors
+/// Returns `Err` if `source` cannot be read. Per-line insert failures are
+/// accumulated in the returned summary without aborting the loop.
+fn run_import_fs_named_index(
+    journal: &Journal,
+    persona: &str,
+    kind: &str,
+    source: &Path,
+    dry_run: bool,
+) -> anyhow::Result<ImportSummary> {
+    let mut summary = ImportSummary {
+        matched: 0,
+        written: 0,
+        skipped: 0,
+        errors: 0,
+        conflicts: Vec::new(),
+    };
+
+    let content = std::fs::read_to_string(source)
+        .map_err(|e| anyhow::anyhow!("failed to read source file {}: {e}", source.display()))?;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            summary.skipped += 1;
+            continue;
+        }
+        summary.matched += 1;
+
+        if dry_run {
+            println!("[would import] persona={persona} kind={kind} line={trimmed}");
+            continue;
+        }
+
+        // name == body == trimmed (this issue scope: name and body carry the same value)
+        match journal.append_named_index(persona, kind, trimmed, trimmed) {
+            Ok(uname) => {
+                println!("imported: {uname}");
+                summary.written += 1;
+            }
+            Err(e) => {
+                tracing::warn!(error=?e, line=%trimmed, "append_named_index failed");
                 summary.errors += 1;
             }
         }
@@ -398,5 +484,102 @@ mod tests {
             v1_body.contains("v1 body"),
             "v1 body must be preserved, got: {v1_body}"
         );
+    }
+
+    // ── named_index helpers ─────────────────────────────────────────────────
+
+    /// Set up a Journal with the "archive" named_index kind registered.
+    fn setup_journal_with_named_index(root: &Path, persona: &str) -> Journal {
+        use persona_journal::KindConfig;
+        let j = Journal::open(root.to_path_buf());
+        j.kind_register(persona, &KindConfig::preset_archive())
+            .unwrap();
+        j
+    }
+
+    // ── T4: named_index — line-by-line insert ───────────────────────────────
+
+    #[test]
+    fn run_import_fs_named_index_inserts_each_line_as_row() {
+        let root_dir = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let src_file = src_dir.path().join("non_rem.md");
+
+        let j = setup_journal_with_named_index(root_dir.path(), "alice");
+        std::fs::write(&src_file, "line one\nline two\nline three\n").unwrap();
+
+        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false).unwrap();
+
+        assert_eq!(summary.matched, 3);
+        assert_eq!(summary.written, 3);
+        assert_eq!(summary.skipped, 0);
+        assert_eq!(summary.errors, 0);
+        assert!(summary.conflicts.is_empty());
+
+        let rows = j.query_latest("alice", "archive", 10).unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    // ── T5: named_index — blank and comment skip ────────────────────────────
+
+    #[test]
+    fn run_import_fs_named_index_skips_blank_and_comment_lines() {
+        let root_dir = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let src_file = src_dir.path().join("non_rem.md");
+
+        let j = setup_journal_with_named_index(root_dir.path(), "alice");
+        let content =
+            "# header comment\n\nfirst real line\n   \n# another comment\nsecond real line\n";
+        std::fs::write(&src_file, content).unwrap();
+
+        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false).unwrap();
+
+        assert_eq!(
+            summary.matched, 2,
+            "only non-blank/non-comment counted as matched"
+        );
+        assert_eq!(summary.written, 2);
+        assert_eq!(summary.skipped, 4, "2 blank + 2 # comment = 4 skipped");
+        assert_eq!(summary.errors, 0);
+    }
+
+    // ── T6: named_index — duplicate lines allowed ───────────────────────────
+
+    #[test]
+    fn run_import_fs_named_index_allows_duplicate_lines() {
+        let root_dir = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let src_file = src_dir.path().join("non_rem.md");
+
+        let j = setup_journal_with_named_index(root_dir.path(), "alice");
+        std::fs::write(&src_file, "same line\nsame line\nsame line\n").unwrap();
+
+        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false).unwrap();
+
+        assert_eq!(summary.written, 3, "duplicate lines must all be inserted");
+        assert_eq!(summary.errors, 0);
+
+        let rows = j.query_latest("alice", "archive", 10).unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    // ── T7: named_index — dry_run does not write ────────────────────────────
+
+    #[test]
+    fn run_import_fs_named_index_dry_run_does_not_write() {
+        let root_dir = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let src_file = src_dir.path().join("non_rem.md");
+
+        let j = setup_journal_with_named_index(root_dir.path(), "alice");
+        std::fs::write(&src_file, "line one\nline two\n").unwrap();
+
+        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, true).unwrap();
+
+        assert_eq!(summary.matched, 2);
+        assert_eq!(summary.written, 0, "dry_run must not write");
+        let rows = j.query_latest("alice", "archive", 10).unwrap();
+        assert!(rows.is_empty());
     }
 }
