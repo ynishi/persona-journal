@@ -562,7 +562,7 @@ impl Db {
             //               5=first_line_cache, 6=retrieval_strength, 7=uname (末尾)
             "SELECT id, kind, created_at, updated_at, current_version, first_line_cache,
                     retrieval_strength, uname
-             FROM entries WHERE kind = ?1 ORDER BY created_at DESC LIMIT ?2",
+             FROM entries WHERE kind = ?1 ORDER BY created_at DESC, seq_in_kind DESC LIMIT ?2",
         )?;
         let rows = stmt
             .query_map(params![kind, n as i64], |r| {
@@ -622,7 +622,7 @@ impl Db {
              FROM entries e
              JOIN kinds k ON e.kind = k.name
              WHERE e.kind = ?1
-             ORDER BY (e.retrieval_strength * k.boost_factor * k.decay_weight * exp(-0.6931471805599453 * (julianday(?2) - julianday(e.created_at)) / k.decay_half_life)) DESC
+             ORDER BY (e.retrieval_strength * k.boost_factor * k.decay_weight * exp(-0.6931471805599453 * (julianday(?2) - julianday(e.created_at)) / k.decay_half_life)) DESC, e.seq_in_kind DESC
              LIMIT ?3",
         )?;
         let rows = stmt
@@ -798,7 +798,7 @@ impl Db {
              FROM entries e
              JOIN kinds k ON e.kind = k.name
              WHERE e.kind = ?1
-             ORDER BY score DESC
+             ORDER BY score DESC, e.seq_in_kind DESC
              LIMIT ?3",
         )?;
         let rows = stmt
