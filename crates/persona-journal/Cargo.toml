@@ -7,6 +7,11 @@ license.workspace      = true
 repository.workspace   = true
 authors.workspace      = true
 rust-version.workspace = true
+include = [
+    "src/**/*.rs",
+    "sql/*.sql",
+    "Cargo.toml",
+]
 
 [lib]
 name = "persona_journal"
