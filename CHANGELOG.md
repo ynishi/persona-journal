@@ -24,6 +24,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **`SCHEMA_SQL` DDL extracted to `crates/persona-journal/sql/v1.sql` via `include_str!`.** The 56-line raw-string DDL literal previously embedded in `db.rs` is now loaded at compile time using `const SCHEMA_SQL: &str = include_str!("../sql/v1.sql");`. The existing idempotent `ALTER TABLE` migration steps for `boost_factor` and `tags` columns remain in `Db::open` unchanged for legacy-database compatibility. `Cargo.toml` gains `package.include = ["src/**/*.rs", "sql/*.sql", "Cargo.toml"]` so that `sql/v1.sql` is bundled when the crate is packaged. No public API change; no schema change; no runtime behaviour change.
+
 - **`entries` schema full redesign — UUID v7 primary key + `uname` first-class identifier.**
   - `entries.id` is now a UUID v7 TEXT (`Uuid::now_v7()` from the `uuid` crate, `features = ["v7"]`).
   - `entries.uname TEXT NOT NULL UNIQUE` added — format `{kind}/{ym}_{seq:06}` (e.g. `emo/2024-08_000001`). `uname` is the sole externally visible entry identifier across all MCP tools, CLI commands, and public library functions. UUID is internal only.
