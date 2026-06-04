@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-06-05
+
 ### Added
 
 - **MCP tool `journal_query_by_retrieval`** — query entries ranked by decay-weighted retrieval strength (top-N, `now` defaults to UTC).
