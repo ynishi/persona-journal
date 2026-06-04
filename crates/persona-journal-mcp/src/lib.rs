@@ -2,13 +2,14 @@
 
 use std::path::PathBuf;
 
-use persona_journal::Journal;
+use persona_journal::{FilterMode, Journal};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::{Deserialize, Serialize};
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 #[derive(Clone)]
 pub struct JournalService {
@@ -77,6 +78,82 @@ pub struct ReloadKindsParams {
     pub root: Option<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct QueryByRetrievalParams {
+    /// Persona id (matches persona-pack id).
+    pub persona: String,
+    /// Kind name (e.g. "emo").
+    pub kind: String,
+    /// Max number of entries to return. Defaults to 10.
+    pub n: Option<usize>,
+    /// Reference time for decay calculation (RFC 3339). Defaults to now (UTC).
+    pub now: Option<String>,
+    /// Optional override of journal root.
+    pub root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FilterParams {
+    /// Persona id (matches persona-pack id).
+    pub persona: String,
+    /// Kind name (e.g. "emo").
+    pub kind: String,
+    /// Filter mode. Use `{"type":"visible","threshold":0.5}` etc.
+    pub mode: FilterModeInput,
+    /// Reference time for decay calculation (RFC 3339). Defaults to now (UTC).
+    pub now: Option<String>,
+    /// Optional override of journal root.
+    pub root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PinParams {
+    /// Persona id (matches persona-pack id).
+    pub persona: String,
+    /// Entry uname (e.g. `"emo/2024-08_000012"`).
+    pub entry_id: String,
+    /// Retrieval strength to pin to. Defaults to 1.0 (neutral) when omitted.
+    pub strength: Option<f64>,
+    /// Optional override of journal root.
+    pub root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnpinParams {
+    /// Persona id (matches persona-pack id).
+    pub persona: String,
+    /// Entry uname (e.g. `"emo/2024-08_000012"`).
+    pub entry_id: String,
+    /// Optional override of journal root.
+    pub root: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BoostKindParams {
+    /// Persona id (matches persona-pack id).
+    pub persona: String,
+    /// Kind name (e.g. "emo").
+    pub kind: String,
+    /// Boost factor (must be > 0.0 and not NaN).
+    pub factor: f64,
+    /// Optional override of journal root.
+    pub root: Option<String>,
+}
+
+/// Filter mode for `journal_filter`. Use `{"type":"visible","threshold":0.5}` etc.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FilterModeInput {
+    /// Include entries with retrieval score >= threshold.
+    Visible { threshold: f64 },
+    /// Include entries with retrieval score < threshold.
+    Archive { threshold: f64 },
+    /// Top-k entries above threshold.
+    Partial { threshold: f64, top_k: usize },
+    /// All entries, score DESC.
+    Full {},
+}
+
 #[derive(Debug, Serialize)]
 struct SayResult {
     /// Entry uname in `{kind}/{ym}_{seq:06}` format.
@@ -93,6 +170,7 @@ struct EntryRowOut {
     current_version: u32,
     tags: Vec<String>,
     summary: Option<String>,
+    retrieval_strength: f64,
 }
 
 impl From<persona_journal::EntryRow> for EntryRowOut {
@@ -105,6 +183,7 @@ impl From<persona_journal::EntryRow> for EntryRowOut {
             current_version: r.current_version,
             tags: r.tags,
             summary: r.summary,
+            retrieval_strength: r.retrieval_strength,
         }
     }
 }
@@ -212,6 +291,89 @@ impl JournalService {
         let n = j.reload_kinds(&p.persona).map_err(|e| e.to_string())?;
         Ok(format!("{{\"reloaded\":{n}}}"))
     }
+
+    /// Query entries ranked by retrieval strength (decay-weighted). Returns up to `n` rows
+    /// ordered by score DESC. `now` defaults to current UTC time when omitted.
+    #[tool(name = "journal_query_by_retrieval", annotations(open_world_hint = false))]
+    async fn query_by_retrieval(
+        &self,
+        Parameters(p): Parameters<QueryByRetrievalParams>,
+    ) -> Result<String, String> {
+        let j = self.journal(p.root);
+        let now = parse_now_or_default(p.now)?;
+        let rows = j
+            .query_by_retrieval(&p.persona, &p.kind, p.n.unwrap_or(10), now)
+            .map_err(|e| e.to_string())?;
+        let out: Vec<EntryRowOut> = rows.into_iter().map(EntryRowOut::from).collect();
+        serde_json::to_string(&out).map_err(|e| e.to_string())
+    }
+
+    /// Filter entries by retrieval strength using one of four modes (Visible / Archive /
+    /// Partial / Full). `now` defaults to current UTC time when omitted.
+    #[tool(name = "journal_filter", annotations(open_world_hint = false))]
+    async fn filter(
+        &self,
+        Parameters(p): Parameters<FilterParams>,
+    ) -> Result<String, String> {
+        let j = self.journal(p.root);
+        let now = parse_now_or_default(p.now)?;
+        let mode = filter_mode_input_to_core(p.mode);
+        let rows = j
+            .filter(&p.persona, &p.kind, mode, now)
+            .map_err(|e| e.to_string())?;
+        let out: Vec<EntryRowOut> = rows.into_iter().map(EntryRowOut::from).collect();
+        serde_json::to_string(&out).map_err(|e| e.to_string())
+    }
+
+    /// Pin an entry by setting its `retrieval_strength`. Defaults to 1.0 when
+    /// `strength` is omitted. Returns `{"ok":true}` on success.
+    #[tool(name = "journal_pin", annotations(open_world_hint = false))]
+    async fn pin(&self, Parameters(p): Parameters<PinParams>) -> Result<String, String> {
+        let j = self.journal(p.root);
+        j.pin(&p.persona, &p.entry_id, p.strength)
+            .map_err(|e| e.to_string())?;
+        Ok("{\"ok\":true}".to_string())
+    }
+
+    /// Unpin an entry by resetting its `retrieval_strength` to 1.0 (neutral).
+    /// Returns `{"ok":true}` on success.
+    #[tool(name = "journal_unpin", annotations(open_world_hint = false))]
+    async fn unpin(&self, Parameters(p): Parameters<UnpinParams>) -> Result<String, String> {
+        let j = self.journal(p.root);
+        j.unpin(&p.persona, &p.entry_id)
+            .map_err(|e| e.to_string())?;
+        Ok("{\"ok\":true}".to_string())
+    }
+
+    /// Set a kind-wide retrieval boost factor (must be > 0.0 and not NaN).
+    /// Returns `{"ok":true}` on success.
+    #[tool(name = "journal_boost_kind", annotations(open_world_hint = false))]
+    async fn boost_kind(
+        &self,
+        Parameters(p): Parameters<BoostKindParams>,
+    ) -> Result<String, String> {
+        let j = self.journal(p.root);
+        j.boost_kind(&p.persona, &p.kind, p.factor)
+            .map_err(|e| e.to_string())?;
+        Ok("{\"ok\":true}".to_string())
+    }
+}
+
+fn parse_now_or_default(now: Option<String>) -> Result<OffsetDateTime, String> {
+    match now {
+        None => Ok(OffsetDateTime::now_utc()),
+        Some(s) => OffsetDateTime::parse(&s, &Rfc3339)
+            .map_err(|e| format!("invalid 'now' (RFC3339): {e}")),
+    }
+}
+
+fn filter_mode_input_to_core(input: FilterModeInput) -> FilterMode {
+    match input {
+        FilterModeInput::Visible { threshold } => FilterMode::Visible { threshold },
+        FilterModeInput::Archive { threshold } => FilterMode::Archive { threshold },
+        FilterModeInput::Partial { threshold, top_k } => FilterMode::Partial { threshold, top_k },
+        FilterModeInput::Full {} => FilterMode::Full,
+    }
 }
 
 #[tool_handler]
@@ -221,7 +383,9 @@ impl ServerHandler for JournalService {
         info.instructions = Some(
             "persona-journal — local-first diary. Tools: journal_say / \
              journal_query_latest / journal_entry_read / journal_kind_register / \
-             journal_kind_list / journal_projection_rebuild / journal_reload_kinds."
+             journal_kind_list / journal_projection_rebuild / journal_reload_kinds / \
+             journal_query_by_retrieval / journal_filter / journal_pin / \
+             journal_unpin / journal_boost_kind."
                 .to_string(),
         );
         info.capabilities = ServerCapabilities::builder().enable_tools().build();
