@@ -164,11 +164,11 @@ fn make_layout() -> Layout {
 }
 
 // ---------------------------------------------------------------------------
-// tools/list: all seven tools must be advertised.
+// tools/list: all twelve tools must be advertised.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn tools_list_contains_all_seven_tools() {
+fn tools_list_contains_all_twelve_tools() {
     let layout = make_layout();
     let mut client = McpClient::spawn(&layout.root);
     let tools = client.list_tools();
@@ -184,6 +184,11 @@ fn tools_list_contains_all_seven_tools() {
         "journal_kind_list",
         "journal_projection_rebuild",
         "journal_reload_kinds",
+        "journal_query_by_retrieval",
+        "journal_filter",
+        "journal_pin",
+        "journal_unpin",
+        "journal_boost_kind",
     ] {
         assert!(names.contains(&expected), "{expected} missing: {names:?}");
     }
@@ -447,5 +452,225 @@ tags = []
     assert!(
         reloaded >= 1,
         "expected reloaded >= 1 (reload_extra is new), got {reloaded}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// journal_query_by_retrieval: register kind, say 1 entry, query and assert
+// the response array contains 1 item with a retrieval_strength field.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn journal_query_by_retrieval_smoke() {
+    let layout = make_layout();
+    let mut c = McpClient::spawn(&layout.root);
+
+    let persona = "dora";
+    let kind = "mem";
+    let config_toml = format!(
+        "kind = \"{kind}\"\n\
+         mode = \"entries\"\n\
+         path_template = \"{{persona}}/{{kind}}/{{persona}}_{{kind}}_{{yyyy}}-{{mm}}_{{seq:05}}.md\"\n\
+         versioning = true\n\
+         indexed = true\n\
+         tags = []\n"
+    );
+
+    // Register kind.
+    c.call_tool(
+        "journal_kind_register",
+        json!({ "persona": persona, "config_toml": config_toml }),
+    );
+
+    // Append one entry.
+    c.call_tool(
+        "journal_say",
+        json!({ "persona": persona, "kind": kind, "text": "retrieval smoke entry", "tags": [] }),
+    );
+
+    // Query by retrieval — should return at least 1 row with retrieval_strength field.
+    let result = c.call_tool(
+        "journal_query_by_retrieval",
+        json!({ "persona": persona, "kind": kind, "n": 10 }),
+    );
+    let arr = result
+        .as_array()
+        .unwrap_or_else(|| panic!("journal_query_by_retrieval should return array: {result:?}"));
+    assert!(
+        !arr.is_empty(),
+        "journal_query_by_retrieval returned empty array"
+    );
+    assert!(
+        arr[0].get("retrieval_strength").is_some(),
+        "retrieval_strength field missing from response row: {:?}",
+        arr[0]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// journal_filter: register kind, say 1 entry, filter with Visible mode.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn journal_filter_smoke() {
+    let layout = make_layout();
+    let mut c = McpClient::spawn(&layout.root);
+
+    let persona = "dora";
+    let kind = "filter-mem";
+    let config_toml = format!(
+        "kind = \"{kind}\"\n\
+         mode = \"entries\"\n\
+         path_template = \"{{persona}}/{{kind}}/{{persona}}_{{kind}}_{{yyyy}}-{{mm}}_{{seq:05}}.md\"\n\
+         versioning = true\n\
+         indexed = true\n\
+         tags = []\n"
+    );
+
+    c.call_tool(
+        "journal_kind_register",
+        json!({ "persona": persona, "config_toml": config_toml }),
+    );
+    c.call_tool(
+        "journal_say",
+        json!({ "persona": persona, "kind": kind, "text": "filter smoke entry", "tags": [] }),
+    );
+
+    let result = c.call_tool(
+        "journal_filter",
+        json!({
+            "persona": persona,
+            "kind": kind,
+            "mode": { "type": "visible", "threshold": 0.0 },
+        }),
+    );
+    let arr = result
+        .as_array()
+        .unwrap_or_else(|| panic!("journal_filter should return array: {result:?}"));
+    assert!(!arr.is_empty(), "journal_filter returned empty array");
+}
+
+// ---------------------------------------------------------------------------
+// journal_pin + journal_unpin round-trip: pin to 0.5, verify, unpin, verify.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn journal_pin_unpin_round_trip_smoke() {
+    let layout = make_layout();
+    let mut c = McpClient::spawn(&layout.root);
+
+    let persona = "dora";
+    let kind = "pin-mem";
+    let config_toml = format!(
+        "kind = \"{kind}\"\n\
+         mode = \"entries\"\n\
+         path_template = \"{{persona}}/{{kind}}/{{persona}}_{{kind}}_{{yyyy}}-{{mm}}_{{seq:05}}.md\"\n\
+         versioning = true\n\
+         indexed = true\n\
+         tags = []\n"
+    );
+
+    c.call_tool(
+        "journal_kind_register",
+        json!({ "persona": persona, "config_toml": config_toml }),
+    );
+    let say_result = c.call_tool(
+        "journal_say",
+        json!({ "persona": persona, "kind": kind, "text": "pin smoke entry", "tags": [] }),
+    );
+    let entry_id = say_result["id"]
+        .as_str()
+        .expect("journal_say must return id as string");
+
+    // Pin to 0.5.
+    let pin_result = c.call_tool(
+        "journal_pin",
+        json!({ "persona": persona, "entry_id": entry_id, "strength": 0.5 }),
+    );
+    assert_eq!(
+        pin_result.get("ok").and_then(Value::as_bool),
+        Some(true),
+        "journal_pin should return ok:true: {pin_result:?}"
+    );
+
+    // Verify retrieval_strength = 0.5 via query_by_retrieval.
+    let after_pin = c.call_tool(
+        "journal_query_by_retrieval",
+        json!({ "persona": persona, "kind": kind, "n": 10 }),
+    );
+    let arr = after_pin
+        .as_array()
+        .unwrap_or_else(|| panic!("query_by_retrieval should return array: {after_pin:?}"));
+    let strength_after_pin = arr[0]
+        .get("retrieval_strength")
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("retrieval_strength missing after pin: {:?}", arr[0]));
+    assert!(
+        (strength_after_pin - 0.5).abs() < 1e-9,
+        "expected retrieval_strength ≈ 0.5, got {strength_after_pin}"
+    );
+
+    // Unpin — should reset to 1.0.
+    let unpin_result = c.call_tool(
+        "journal_unpin",
+        json!({ "persona": persona, "entry_id": entry_id }),
+    );
+    assert_eq!(
+        unpin_result.get("ok").and_then(Value::as_bool),
+        Some(true),
+        "journal_unpin should return ok:true: {unpin_result:?}"
+    );
+
+    // Verify retrieval_strength = 1.0 after unpin.
+    let after_unpin = c.call_tool(
+        "journal_query_by_retrieval",
+        json!({ "persona": persona, "kind": kind, "n": 10 }),
+    );
+    let arr2 = after_unpin
+        .as_array()
+        .unwrap_or_else(|| panic!("query_by_retrieval should return array: {after_unpin:?}"));
+    let strength_after_unpin = arr2[0]
+        .get("retrieval_strength")
+        .and_then(Value::as_f64)
+        .unwrap_or_else(|| panic!("retrieval_strength missing after unpin: {:?}", arr2[0]));
+    assert!(
+        (strength_after_unpin - 1.0).abs() < 1e-9,
+        "expected retrieval_strength ≈ 1.0 after unpin, got {strength_after_unpin}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// journal_boost_kind: register kind, set boost, verify ok response.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn journal_boost_kind_smoke() {
+    let layout = make_layout();
+    let mut c = McpClient::spawn(&layout.root);
+
+    let persona = "dora";
+    let kind = "boost-mem";
+    let config_toml = format!(
+        "kind = \"{kind}\"\n\
+         mode = \"entries\"\n\
+         path_template = \"{{persona}}/{{kind}}/{{persona}}_{{kind}}_{{yyyy}}-{{mm}}_{{seq:05}}.md\"\n\
+         versioning = true\n\
+         indexed = true\n\
+         tags = []\n"
+    );
+
+    c.call_tool(
+        "journal_kind_register",
+        json!({ "persona": persona, "config_toml": config_toml }),
+    );
+
+    let result = c.call_tool(
+        "journal_boost_kind",
+        json!({ "persona": persona, "kind": kind, "factor": 2.0 }),
+    );
+    assert_eq!(
+        result.get("ok").and_then(Value::as_bool),
+        Some(true),
+        "journal_boost_kind should return ok:true: {result:?}"
     );
 }

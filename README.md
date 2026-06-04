@@ -56,6 +56,11 @@ The internal UUID v7 primary key is never exposed outside the library.
 - `journal_kind_list` — list registered kinds
 - `journal_projection_rebuild` — rebuild FS projection (entry .md + `_index.md`) from DB SoT
 - `journal_reload_kinds` — re-scan `<root>/<persona>/.journal.toml` and insert new kinds
+- `journal_query_by_retrieval` — query entries ranked by decay-weighted retrieval strength (top-N)
+- `journal_filter` — filter entries by retrieval score (Visible / Archive / Partial / Full modes)
+- `journal_pin` — pin an entry by setting its `retrieval_strength`
+- `journal_unpin` — unpin an entry by resetting `retrieval_strength` to 1.0 (neutral)
+- `journal_boost_kind` — set a kind-wide retrieval boost factor
 
 The `emo` and `archive` presets are available via `KindConfig::preset_emo()` and
 `KindConfig::preset_archive()` respectively. `emo` is auto-registered on first use.

@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- **MCP tool `journal_query_by_retrieval`** — query entries ranked by decay-weighted retrieval strength (top-N, `now` defaults to UTC).
+- **MCP tool `journal_filter`** — filter entries by retrieval score using Visible / Archive / Partial / Full modes.
+- **MCP tool `journal_pin`** — pin an entry by setting `retrieval_strength` to a given value (defaults to 1.0).
+- **MCP tool `journal_unpin`** — unpin an entry by resetting `retrieval_strength` to 1.0 (neutral).
+- **MCP tool `journal_boost_kind`** — set a kind-wide `boost_factor` multiplier for retrieval scoring.
+- **`EntryRowOut.retrieval_strength`** — all 12 tool responses now include `retrieval_strength: f64` in each entry row (forward-compatible addition).
+
 ## [0.2.0] - 2026-05-25
 
 ### Added
