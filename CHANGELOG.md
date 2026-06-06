@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- **MCP tool `journal_query_latest` — `kind` parameter accepts multi-kind selectors and the return shape is unified to a kind-keyed JSON object.** `kind` now accepts three forms: a single kind name (`"state"`), a comma-separated list (`"state,memory,emo"`, whitespace around tokens trimmed, empty tokens dropped), or `"all"` (every kind registered for the persona via `kind_list`). The response is **always** a JSON object keyed by kind name with entry arrays as values (e.g. `{"state": [<row>, ...], "memory": [<row>, ...]}`) — the previous flat-array shape for single-kind queries is no longer returned, so callers must read by kind key. `count` (default 10) applies per kind. Empty / whitespace-only `kind` and an `"all"` query against a persona with no registered kinds return an error. Internal helpers `resolve_kinds` and `parse_kind_list` added with 10 unit / integration tests (`tests::parse_kind_list_*` × 5, `tests::resolve_kinds_*` × 5).
+
 ## [0.3.0] - 2026-06-05
 
 ### Added

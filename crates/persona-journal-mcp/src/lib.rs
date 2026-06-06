@@ -35,9 +35,14 @@ pub struct SayParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueryLatestParams {
+    /// Persona id (matches persona-pack id).
     pub persona: String,
+    /// Kind selector. One of:
+    /// - single kind name: `"state"`
+    /// - comma-separated list: `"state,memory,emo"` (whitespace around tokens is trimmed)
+    /// - `"all"` — every kind registered for the persona
     pub kind: String,
-    /// Max rows. Defaults to 10.
+    /// Max rows per kind. Defaults to 10.
     pub count: Option<usize>,
     pub root: Option<String>,
 }
@@ -218,17 +223,34 @@ impl JournalService {
         serde_json::to_string(&SayResult { id }).map_err(|e| e.to_string())
     }
 
-    /// Query latest entries of a kind (DESC by created_at).
+    /// Query latest entries (DESC by created_at), grouped by kind.
+    ///
+    /// The `kind` parameter accepts three forms:
+    /// - single kind: `"state"` — returns `{"state": [<row>, ...]}`
+    /// - comma-separated list: `"state,memory,emo"` — returns one key per kind
+    /// - `"all"` — returns one key per kind registered for the persona
+    ///
+    /// Always returns a JSON **object** keyed by kind name (uniform shape across
+    /// single / multi / all). Whitespace around comma-separated tokens is trimmed.
     #[tool(name = "journal_query_latest", annotations(open_world_hint = false))]
     async fn query_latest(
         &self,
         Parameters(p): Parameters<QueryLatestParams>,
     ) -> Result<String, String> {
         let j = self.journal(p.root);
-        let rows = j
-            .query_latest(&p.persona, &p.kind, p.count.unwrap_or(10))
-            .map_err(|e| e.to_string())?;
-        let out: Vec<EntryRowOut> = rows.into_iter().map(EntryRowOut::from).collect();
+        let kinds = resolve_kinds(&j, &p.persona, &p.kind)?;
+        let n = p.count.unwrap_or(10);
+        let mut out: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        for k in &kinds {
+            let rows = j
+                .query_latest(&p.persona, k, n)
+                .map_err(|e| e.to_string())?;
+            let rows_out: Vec<EntryRowOut> = rows.into_iter().map(EntryRowOut::from).collect();
+            out.insert(
+                k.clone(),
+                serde_json::to_value(rows_out).map_err(|e| e.to_string())?,
+            );
+        }
         serde_json::to_string(&out).map_err(|e| e.to_string())
     }
 
@@ -359,6 +381,48 @@ impl JournalService {
     }
 }
 
+/// Resolve the `kind` parameter accepted by `journal_query_latest` into a list
+/// of concrete kind names.
+///
+/// - `"all"` — every kind registered for the persona (via `kind_list`)
+/// - comma-separated (`"a,b,c"`) — delegated to [`parse_kind_list`]
+/// - single non-empty token — single-element vec
+/// - empty / whitespace-only — error
+fn resolve_kinds(j: &Journal, persona: &str, kind: &str) -> Result<Vec<String>, String> {
+    let trimmed = kind.trim();
+    if trimmed.is_empty() {
+        return Err("kind parameter is empty".to_string());
+    }
+    if trimmed == "all" {
+        let configs = j.kind_list(persona).map_err(|e| e.to_string())?;
+        let kinds: Vec<String> = configs.into_iter().map(|c| c.kind).collect();
+        if kinds.is_empty() {
+            return Err(format!("no kinds registered for persona '{persona}'"));
+        }
+        return Ok(kinds);
+    }
+    parse_kind_list(trimmed)
+}
+
+/// Pure parser for the non-`"all"` form: single token or comma-separated list.
+/// Whitespace around tokens is trimmed; empty tokens are dropped. Returns an
+/// error if every token is empty (e.g. input was `",,,"`).
+fn parse_kind_list(input: &str) -> Result<Vec<String>, String> {
+    if !input.contains(',') {
+        return Ok(vec![input.to_string()]);
+    }
+    let kinds: Vec<String> = input
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if kinds.is_empty() {
+        Err("kind parameter has no non-empty tokens after trimming".to_string())
+    } else {
+        Ok(kinds)
+    }
+}
+
 fn parse_now_or_default(now: Option<String>) -> Result<OffsetDateTime, String> {
     match now {
         None => Ok(OffsetDateTime::now_utc()),
@@ -373,6 +437,111 @@ fn filter_mode_input_to_core(input: FilterModeInput) -> FilterMode {
         FilterModeInput::Archive { threshold } => FilterMode::Archive { threshold },
         FilterModeInput::Partial { threshold, top_k } => FilterMode::Partial { threshold, top_k },
         FilterModeInput::Full {} => FilterMode::Full,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_kind_list_single_token() {
+        assert_eq!(parse_kind_list("state").unwrap(), vec!["state".to_string()]);
+    }
+
+    #[test]
+    fn parse_kind_list_comma_separated() {
+        assert_eq!(
+            parse_kind_list("state,memory,emo").unwrap(),
+            vec![
+                "state".to_string(),
+                "memory".to_string(),
+                "emo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_kind_list_trims_whitespace() {
+        assert_eq!(
+            parse_kind_list("state, memory ,  emo").unwrap(),
+            vec![
+                "state".to_string(),
+                "memory".to_string(),
+                "emo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_kind_list_drops_empty_tokens() {
+        assert_eq!(
+            parse_kind_list("state,,memory").unwrap(),
+            vec!["state".to_string(), "memory".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_kind_list_only_commas_errors() {
+        assert!(parse_kind_list(",,,").is_err());
+    }
+
+    fn open_tmp_journal() -> (tempfile::TempDir, Journal) {
+        let tmp = tempfile::tempdir().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        (tmp, j)
+    }
+
+    #[test]
+    fn resolve_kinds_single_passes_through() {
+        let (_tmp, j) = open_tmp_journal();
+        let r = resolve_kinds(&j, "anyone", "state").unwrap();
+        assert_eq!(r, vec!["state".to_string()]);
+    }
+
+    #[test]
+    fn resolve_kinds_comma_sep_passes_through() {
+        let (_tmp, j) = open_tmp_journal();
+        let r = resolve_kinds(&j, "anyone", "state, memory, emo").unwrap();
+        assert_eq!(
+            r,
+            vec![
+                "state".to_string(),
+                "memory".to_string(),
+                "emo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_kinds_empty_errors() {
+        let (_tmp, j) = open_tmp_journal();
+        assert!(resolve_kinds(&j, "anyone", "").is_err());
+        assert!(resolve_kinds(&j, "anyone", "   ").is_err());
+    }
+
+    #[test]
+    fn resolve_kinds_all_returns_registered_kinds() {
+        let (_tmp, j) = open_tmp_journal();
+        let persona = "shi";
+        let toml_for = |kind: &str| {
+            format!(
+                "kind = \"{kind}\"\nmode = \"entries\"\npath_template = \"{{persona}}/{kind}/{{persona}}_{kind}_{{yyyy}}-{{mm}}_{{seq:05}}.md\"\n"
+            )
+        };
+        j.register_kind_from_toml(persona, &toml_for("alpha"))
+            .unwrap();
+        j.register_kind_from_toml(persona, &toml_for("beta"))
+            .unwrap();
+        let mut kinds = resolve_kinds(&j, persona, "all").unwrap();
+        kinds.sort();
+        assert_eq!(kinds, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn resolve_kinds_all_errors_when_no_kinds_registered() {
+        let (_tmp, j) = open_tmp_journal();
+        assert!(resolve_kinds(&j, "ghost", "all").is_err());
     }
 }
 
