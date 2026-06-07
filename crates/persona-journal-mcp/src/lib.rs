@@ -320,7 +320,10 @@ impl JournalService {
 
     /// Query entries ranked by retrieval strength (decay-weighted). Returns up to `n` rows
     /// ordered by score DESC. `now` defaults to current UTC time when omitted.
-    #[tool(name = "journal_query_by_retrieval", annotations(open_world_hint = false))]
+    #[tool(
+        name = "journal_query_by_retrieval",
+        annotations(open_world_hint = false)
+    )]
     async fn query_by_retrieval(
         &self,
         Parameters(p): Parameters<QueryByRetrievalParams>,
@@ -337,10 +340,7 @@ impl JournalService {
     /// Filter entries by retrieval strength using one of four modes (Visible / Archive /
     /// Partial / Full). `now` defaults to current UTC time when omitted.
     #[tool(name = "journal_filter", annotations(open_world_hint = false))]
-    async fn filter(
-        &self,
-        Parameters(p): Parameters<FilterParams>,
-    ) -> Result<String, String> {
+    async fn filter(&self, Parameters(p): Parameters<FilterParams>) -> Result<String, String> {
         let j = self.journal(p.root);
         let now = parse_now_or_default(p.now)?;
         let mode = filter_mode_input_to_core(p.mode);
@@ -430,8 +430,9 @@ fn parse_kind_list(input: &str) -> Result<Vec<String>, String> {
 fn parse_now_or_default(now: Option<String>) -> Result<OffsetDateTime, String> {
     match now {
         None => Ok(OffsetDateTime::now_utc()),
-        Some(s) => OffsetDateTime::parse(&s, &Rfc3339)
-            .map_err(|e| format!("invalid 'now' (RFC3339): {e}")),
+        Some(s) => {
+            OffsetDateTime::parse(&s, &Rfc3339).map_err(|e| format!("invalid 'now' (RFC3339): {e}"))
+        }
     }
 }
 
@@ -441,6 +442,23 @@ fn filter_mode_input_to_core(input: FilterModeInput) -> FilterMode {
         FilterModeInput::Archive { threshold } => FilterMode::Archive { threshold },
         FilterModeInput::Partial { threshold, top_k } => FilterMode::Partial { threshold, top_k },
         FilterModeInput::Full {} => FilterMode::Full,
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for JournalService {
+    fn get_info(&self) -> ServerInfo {
+        let mut info = ServerInfo::default();
+        info.instructions = Some(
+            "persona-journal — local-first diary. Tools: journal_say / \
+             journal_query_latest / journal_entry_read / journal_kind_register / \
+             journal_kind_list / journal_projection_rebuild / journal_reload_kinds / \
+             journal_query_by_retrieval / journal_filter / journal_pin / \
+             journal_unpin / journal_boost_kind."
+                .to_string(),
+        );
+        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info
     }
 }
 
@@ -457,11 +475,7 @@ mod tests {
     fn parse_kind_list_comma_separated() {
         assert_eq!(
             parse_kind_list("state,memory,emo").unwrap(),
-            vec![
-                "state".to_string(),
-                "memory".to_string(),
-                "emo".to_string()
-            ]
+            vec!["state".to_string(), "memory".to_string(), "emo".to_string()]
         );
     }
 
@@ -469,11 +483,7 @@ mod tests {
     fn parse_kind_list_trims_whitespace() {
         assert_eq!(
             parse_kind_list("state, memory ,  emo").unwrap(),
-            vec![
-                "state".to_string(),
-                "memory".to_string(),
-                "emo".to_string()
-            ]
+            vec!["state".to_string(), "memory".to_string(), "emo".to_string()]
         );
     }
 
@@ -509,11 +519,7 @@ mod tests {
         let r = resolve_kinds(&j, "anyone", "state, memory, emo").unwrap();
         assert_eq!(
             r,
-            vec![
-                "state".to_string(),
-                "memory".to_string(),
-                "emo".to_string()
-            ]
+            vec!["state".to_string(), "memory".to_string(), "emo".to_string()]
         );
     }
 
@@ -546,22 +552,5 @@ mod tests {
     fn resolve_kinds_all_errors_when_no_kinds_registered() {
         let (_tmp, j) = open_tmp_journal();
         assert!(resolve_kinds(&j, "ghost", "all").is_err());
-    }
-}
-
-#[tool_handler]
-impl ServerHandler for JournalService {
-    fn get_info(&self) -> ServerInfo {
-        let mut info = ServerInfo::default();
-        info.instructions = Some(
-            "persona-journal — local-first diary. Tools: journal_say / \
-             journal_query_latest / journal_entry_read / journal_kind_register / \
-             journal_kind_list / journal_projection_rebuild / journal_reload_kinds / \
-             journal_query_by_retrieval / journal_filter / journal_pin / \
-             journal_unpin / journal_boost_kind."
-                .to_string(),
-        );
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info
     }
 }

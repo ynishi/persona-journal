@@ -550,7 +550,8 @@ mod tests {
         let j = setup_journal_with_named_index(root_dir.path(), "alice");
         std::fs::write(&src_file, "line one\nline two\nline three\n").unwrap();
 
-        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false, false).unwrap();
+        let summary =
+            run_import_fs(&j, "alice", "archive", &src_file, false, false, false).unwrap();
 
         assert_eq!(summary.matched, 3);
         assert_eq!(summary.written, 3);
@@ -575,7 +576,8 @@ mod tests {
             "# header comment\n\nfirst real line\n   \n# another comment\nsecond real line\n";
         std::fs::write(&src_file, content).unwrap();
 
-        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false, false).unwrap();
+        let summary =
+            run_import_fs(&j, "alice", "archive", &src_file, false, false, false).unwrap();
 
         assert_eq!(
             summary.matched, 2,
@@ -597,7 +599,8 @@ mod tests {
         let j = setup_journal_with_named_index(root_dir.path(), "alice");
         std::fs::write(&src_file, "same line\nsame line\nsame line\n").unwrap();
 
-        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false, false).unwrap();
+        let summary =
+            run_import_fs(&j, "alice", "archive", &src_file, false, false, false).unwrap();
 
         assert_eq!(summary.written, 3, "duplicate lines must all be inserted");
         assert_eq!(summary.errors, 0);
@@ -685,7 +688,10 @@ mod tests {
             1,
             "entries mode must rely on uname collision, dedup_by_line is a no-op"
         );
-        assert_eq!(s2.skipped, 0, "dedup_by_line must not bump skipped in entries mode");
+        assert_eq!(
+            s2.skipped, 0,
+            "dedup_by_line must not bump skipped in entries mode"
+        );
     }
 
     // ── T7: named_index — dry_run does not write ────────────────────────────

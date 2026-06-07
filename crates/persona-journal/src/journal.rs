@@ -3968,7 +3968,9 @@ tags = []
 
         // No newline / no leading non-empty line distinct from body: same string
         // becomes both name and body via the extract_first_line happy path.
-        let id = j.say_any(persona, "archive", "single-token", vec![]).unwrap();
+        let id = j
+            .say_any(persona, "archive", "single-token", vec![])
+            .unwrap();
         let rows = j.query_latest(persona, "archive", 10).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].summary.as_deref(), Some("single-token"));
