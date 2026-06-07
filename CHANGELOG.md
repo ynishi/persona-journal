@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-07
+
 ### Added
 
 - **`Journal::say_any` — mode-dispatching writer.** `pub fn say_any(&self, persona, kind, text, tags) -> Result<String>` resolves the registered kind's `mode` once and routes to `say()` (entries) or `append_named_index()` (named_index) so callers don't have to branch on mode. For `NamedIndex`, the row `name` is derived from the first non-empty line of `text` (matching the entries-mode body-summary extraction); when no non-empty line is found, the first 80 chars of `text` are used as a fallback. `tags` are honoured for entries mode only (named_index API does not currently persist tags). MCP tool `journal_say` now routes through `say_any`, so named_index kinds work end-to-end from the MCP surface. Unit tests: `say_any_dispatches_entries_and_named_index` / `say_any_named_index_falls_back_to_truncated_text_when_no_first_line`.
