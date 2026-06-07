@@ -479,6 +479,40 @@ impl Journal {
     ///
     /// # Panics
     /// Does not panic. All lock failures are propagated as `Err`.
+    /// Mode-dispatching wrapper around [`Self::say`] / [`Self::append_named_index`].
+    ///
+    /// Resolves the kind's `mode` once and routes to the right writer so callers
+    /// don't have to branch on mode. For `NamedIndex`, the row `name` is derived
+    /// from the first non-empty line of `text` (matching `entries` body summary
+    /// extraction); if no line is found, the first 80 chars of `text` are used.
+    /// `tags` are honoured for entries mode; named_index does not persist tags
+    /// (API limitation, tracked separately).
+    pub fn say_any(
+        &self,
+        persona: &str,
+        kind: &str,
+        text: &str,
+        tags: Vec<String>,
+    ) -> Result<String> {
+        let db_arc = self.open_db(persona)?;
+        let mode = {
+            let db = db_arc
+                .lock()
+                .map_err(|e| Error::Invalid(format!("db lock poisoned: {e}")))?;
+            db.get_kind(kind)?
+                .ok_or_else(|| Error::UnknownKind(kind.to_string()))?
+                .mode
+        };
+        match mode {
+            KindMode::Entries => self.say(persona, kind, text, tags),
+            KindMode::NamedIndex => {
+                let name = extract_first_line(text)
+                    .unwrap_or_else(|| text.chars().take(80).collect::<String>());
+                self.append_named_index(persona, kind, &name, text)
+            }
+        }
+    }
+
     pub fn say(&self, persona: &str, kind: &str, text: &str, tags: Vec<String>) -> Result<String> {
         let db_arc = self.open_db(persona)?;
         let db = db_arc
@@ -557,6 +591,37 @@ impl Journal {
     /// Same lock discipline as `say()`: outer `Mutex<HashMap>` released before returning
     /// `Arc<Mutex<Db>>`, inner `Mutex<Db>` released before this function returns.
     /// Concurrent calls for the same persona serialize at the inner lock.
+    /// Look up an existing named_index row by its `first_line_cache` value.
+    ///
+    /// Returns `Ok(Some(uname))` for the first matching row, `Ok(None)` when
+    /// no row has `first_line_cache == name`. Used by `import-fs
+    /// --dedup-by-line` to skip lines already present.
+    ///
+    /// # Errors
+    /// - `Error::UnknownKind` — `kind` is not registered for `persona`
+    /// - `Error::Invalid` — `kind` is not in `NamedIndex` mode, or the db lock is poisoned
+    /// - `Error::Sqlite` — DB failure
+    pub fn find_named_index_by_name(
+        &self,
+        persona: &str,
+        kind: &str,
+        name: &str,
+    ) -> Result<Option<String>> {
+        let db_arc = self.open_db(persona)?;
+        let db = db_arc
+            .lock()
+            .map_err(|e| Error::Invalid(format!("db lock poisoned: {e}")))?;
+        let kind_cfg = db
+            .get_kind(kind)?
+            .ok_or_else(|| Error::UnknownKind(kind.to_string()))?;
+        if !matches!(kind_cfg.mode, KindMode::NamedIndex) {
+            return Err(Error::Invalid(
+                "find_named_index_by_name supports named_index mode only".to_string(),
+            ));
+        }
+        db.find_uname_by_first_line(kind, name)
+    }
+
     pub fn append_named_index(
         &self,
         persona: &str,
@@ -3854,6 +3919,61 @@ tags = []
             ),
             other => panic!("expected Error::Invalid, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn say_any_dispatches_entries_and_named_index() {
+        use crate::schema::KindConfig;
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        let persona = "alice";
+        j.kind_register(persona, &KindConfig::preset_emo()).unwrap();
+        j.kind_register(persona, &KindConfig::preset_archive())
+            .unwrap();
+
+        let entries_id = j
+            .say_any(persona, "emo", "first line\nrest", vec![])
+            .unwrap();
+        assert!(
+            entries_id.starts_with("emo/"),
+            "entries dispatch: {entries_id}"
+        );
+
+        let ni_id = j
+            .say_any(
+                persona,
+                "archive",
+                "named-index summary line\nbody continues",
+                vec![],
+            )
+            .unwrap();
+        assert!(
+            ni_id.starts_with("archive/"),
+            "named_index dispatch: {ni_id}"
+        );
+
+        let rows = j.query_latest(persona, "archive", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary.as_deref(), Some("named-index summary line"));
+    }
+
+    #[test]
+    fn say_any_named_index_falls_back_to_truncated_text_when_no_first_line() {
+        use crate::schema::KindConfig;
+        let tmp = TempDir::new().unwrap();
+        let j = Journal::open(tmp.path().to_path_buf());
+        let persona = "alice";
+        j.kind_register(persona, &KindConfig::preset_archive())
+            .unwrap();
+
+        // No newline / no leading non-empty line distinct from body: same string
+        // becomes both name and body via the extract_first_line happy path.
+        let id = j.say_any(persona, "archive", "single-token", vec![]).unwrap();
+        let rows = j.query_latest(persona, "archive", 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary.as_deref(), Some("single-token"));
+        let body = j.entry_read(persona, &id, None).unwrap();
+        assert!(body.contains("single-token"));
     }
 
     #[test]

@@ -45,6 +45,12 @@ enum Cmd {
         force_override: bool,
         #[arg(long)]
         dry_run: bool,
+        /// Skip lines whose `first_line_cache` already exists for
+        /// `(persona, kind)`. Only effective for `named_index` mode;
+        /// `entries` mode treats this as a no-op (uname collision already
+        /// handles dedup).
+        #[arg(long)]
+        dedup_by_line: bool,
     },
 }
 
@@ -115,6 +121,7 @@ fn run_import_fs(
     source: &Path,
     force_override: bool,
     dry_run: bool,
+    dedup_by_line: bool,
 ) -> anyhow::Result<ImportSummary> {
     let kind_cfg = journal
         .kind_get(persona, kind)?
@@ -122,9 +129,12 @@ fn run_import_fs(
 
     match kind_cfg.mode {
         KindMode::Entries => {
+            // entries mode: --dedup-by-line is a no-op (uname collision already dedups).
             run_import_fs_entries(journal, persona, kind, source, force_override, dry_run)
         }
-        KindMode::NamedIndex => run_import_fs_named_index(journal, persona, kind, source, dry_run),
+        KindMode::NamedIndex => {
+            run_import_fs_named_index(journal, persona, kind, source, dry_run, dedup_by_line)
+        }
     }
 }
 
@@ -262,6 +272,7 @@ fn run_import_fs_named_index(
     kind: &str,
     source: &Path,
     dry_run: bool,
+    dedup_by_line: bool,
 ) -> anyhow::Result<ImportSummary> {
     let mut summary = ImportSummary {
         matched: 0,
@@ -281,6 +292,28 @@ fn run_import_fs_named_index(
             continue;
         }
         summary.matched += 1;
+
+        if dedup_by_line {
+            match journal.find_named_index_by_name(persona, kind, trimmed) {
+                Ok(Some(existing)) => {
+                    if dry_run {
+                        println!(
+                            "[would skip dedup] persona={persona} kind={kind} existing={existing} line={trimmed}"
+                        );
+                    } else {
+                        println!("dedup skip: existing={existing}");
+                    }
+                    summary.skipped += 1;
+                    continue;
+                }
+                Ok(None) => { /* fall through to append */ }
+                Err(e) => {
+                    tracing::warn!(error=?e, line=%trimmed, "dedup lookup failed, treating as new");
+                    summary.errors += 1;
+                    // fall through and attempt append so we don't silently drop the line
+                }
+            }
+        }
 
         if dry_run {
             println!("[would import] persona={persona} kind={kind} line={trimmed}");
@@ -336,9 +369,18 @@ async fn main() -> Result<()> {
             source,
             force_override,
             dry_run,
+            dedup_by_line,
         } => {
             let j = Journal::open(root);
-            let summary = run_import_fs(&j, &persona, &kind, &source, force_override, dry_run)?;
+            let summary = run_import_fs(
+                &j,
+                &persona,
+                &kind,
+                &source,
+                force_override,
+                dry_run,
+                dedup_by_line,
+            )?;
             println!(
                 "imported: persona={persona} kind={kind} matched={} written={} skipped={} conflicts={} errors={}",
                 summary.matched,
@@ -421,7 +463,7 @@ mod tests {
         let j = setup_journal(root_dir.path(), "shi");
         write_src_file(src_dir.path(), "2026-05_00001.md", "dry run body");
 
-        let summary = run_import_fs(&j, "shi", "emo", src_dir.path(), false, true).unwrap();
+        let summary = run_import_fs(&j, "shi", "emo", src_dir.path(), false, true, false).unwrap();
 
         // dry_run must not increment written
         assert_eq!(summary.written, 0);
@@ -446,14 +488,14 @@ mod tests {
         write_src_file(src_dir.path(), "2026-05_00001.md", "v1 body");
 
         // Stage 1: normal import → written=1
-        let s1 = run_import_fs(&j, "shi", "emo", src_dir.path(), false, false).unwrap();
+        let s1 = run_import_fs(&j, "shi", "emo", src_dir.path(), false, false, false).unwrap();
         assert_eq!(s1.written, 1);
         assert_eq!(s1.matched, 1);
         assert!(s1.conflicts.is_empty());
         assert_eq!(s1.errors, 0);
 
         // Stage 2: re-import without force_override → conflict=1, written=0
-        let s2 = run_import_fs(&j, "shi", "emo", src_dir.path(), false, false).unwrap();
+        let s2 = run_import_fs(&j, "shi", "emo", src_dir.path(), false, false, false).unwrap();
         assert_eq!(s2.written, 0);
         assert_eq!(s2.conflicts.len(), 1);
         // CRUX-1: conflict payload is uname (not UUID)
@@ -466,7 +508,7 @@ mod tests {
         // Stage 3: re-import with force_override=true → written=1, creates v2
         // overwrite file content to verify body change
         write_src_file(src_dir.path(), "2026-05_00001.md", "v2 body");
-        let s3 = run_import_fs(&j, "shi", "emo", src_dir.path(), true, false).unwrap();
+        let s3 = run_import_fs(&j, "shi", "emo", src_dir.path(), true, false, false).unwrap();
         assert_eq!(s3.written, 1);
         assert!(s3.conflicts.is_empty());
 
@@ -508,7 +550,7 @@ mod tests {
         let j = setup_journal_with_named_index(root_dir.path(), "alice");
         std::fs::write(&src_file, "line one\nline two\nline three\n").unwrap();
 
-        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false).unwrap();
+        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false, false).unwrap();
 
         assert_eq!(summary.matched, 3);
         assert_eq!(summary.written, 3);
@@ -533,7 +575,7 @@ mod tests {
             "# header comment\n\nfirst real line\n   \n# another comment\nsecond real line\n";
         std::fs::write(&src_file, content).unwrap();
 
-        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false).unwrap();
+        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false, false).unwrap();
 
         assert_eq!(
             summary.matched, 2,
@@ -555,13 +597,95 @@ mod tests {
         let j = setup_journal_with_named_index(root_dir.path(), "alice");
         std::fs::write(&src_file, "same line\nsame line\nsame line\n").unwrap();
 
-        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false).unwrap();
+        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, false, false).unwrap();
 
         assert_eq!(summary.written, 3, "duplicate lines must all be inserted");
         assert_eq!(summary.errors, 0);
 
         let rows = j.query_latest("alice", "archive", 10).unwrap();
         assert_eq!(rows.len(), 3);
+    }
+
+    // ── T8: --dedup-by-line skips lines already present in named_index ──────
+
+    #[test]
+    fn run_import_fs_named_index_dedup_by_line_skips_existing_on_second_run() {
+        let root_dir = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let src_file = src_dir.path().join("non_rem.md");
+
+        let j = setup_journal_with_named_index(root_dir.path(), "alice");
+        std::fs::write(&src_file, "line a\nline b\nline c\n").unwrap();
+
+        // 1st run with dedup_by_line=true: all 3 are new.
+        let s1 = run_import_fs(&j, "alice", "archive", &src_file, false, false, true).unwrap();
+        assert_eq!(s1.written, 3);
+        assert_eq!(s1.skipped, 0);
+
+        // 2nd run with same content + dedup_by_line=true: all 3 must skip.
+        let s2 = run_import_fs(&j, "alice", "archive", &src_file, false, false, true).unwrap();
+        assert_eq!(s2.written, 0, "all 3 lines must skip via dedup");
+        assert_eq!(s2.skipped, 3);
+        assert_eq!(s2.errors, 0);
+
+        let rows = j.query_latest("alice", "archive", 10).unwrap();
+        assert_eq!(rows.len(), 3, "no duplicates inserted on 2nd run");
+    }
+
+    // ── T9: --dedup-by-line mixed input (some dup, some new) ────────────────
+
+    #[test]
+    fn run_import_fs_named_index_dedup_by_line_appends_only_new_lines() {
+        let root_dir = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+        let src_file = src_dir.path().join("non_rem.md");
+
+        let j = setup_journal_with_named_index(root_dir.path(), "alice");
+        std::fs::write(&src_file, "old1\nold2\n").unwrap();
+        run_import_fs(&j, "alice", "archive", &src_file, false, false, true).unwrap();
+
+        // Mixed: 2 already present + 2 new.
+        std::fs::write(&src_file, "old1\nnew1\nold2\nnew2\n").unwrap();
+        let s = run_import_fs(&j, "alice", "archive", &src_file, false, false, true).unwrap();
+        assert_eq!(s.matched, 4);
+        assert_eq!(s.written, 2, "only new1/new2 appended");
+        assert_eq!(s.skipped, 2, "old1/old2 deduped");
+
+        let rows = j.query_latest("alice", "archive", 10).unwrap();
+        assert_eq!(rows.len(), 4);
+    }
+
+    // ── T10: --dedup-by-line is a no-op for entries mode kinds ──────────────
+
+    #[test]
+    fn run_import_fs_entries_dedup_by_line_is_noop() {
+        // entries mode: dedup_by_line must NOT alter behavior — uname collision
+        // handles dedup already. Confirm a 2nd same-source run still emits the
+        // "already exists" conflict path, not a dedup skip.
+        let root_dir = TempDir::new().unwrap();
+        let src_dir = TempDir::new().unwrap();
+
+        let j = Journal::open(root_dir.path().to_path_buf());
+        j.ensure_default_kinds("shi").unwrap();
+
+        let ym = "2026-06";
+        let seq_label = "00001";
+        let filename = format!("{ym}_{seq_label}.md");
+        std::fs::write(src_dir.path().join(&filename), "body once").unwrap();
+
+        let s1 = run_import_fs(&j, "shi", "emo", src_dir.path(), false, false, true).unwrap();
+        assert_eq!(s1.written, 1);
+        assert_eq!(s1.conflicts.len(), 0);
+
+        // 2nd run: uname collision → already exists conflict (NOT dedup skip).
+        let s2 = run_import_fs(&j, "shi", "emo", src_dir.path(), false, false, true).unwrap();
+        assert_eq!(s2.written, 0);
+        assert_eq!(
+            s2.conflicts.len(),
+            1,
+            "entries mode must rely on uname collision, dedup_by_line is a no-op"
+        );
+        assert_eq!(s2.skipped, 0, "dedup_by_line must not bump skipped in entries mode");
     }
 
     // ── T7: named_index — dry_run does not write ────────────────────────────
@@ -575,7 +699,7 @@ mod tests {
         let j = setup_journal_with_named_index(root_dir.path(), "alice");
         std::fs::write(&src_file, "line one\nline two\n").unwrap();
 
-        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, true).unwrap();
+        let summary = run_import_fs(&j, "alice", "archive", &src_file, false, true, false).unwrap();
 
         assert_eq!(summary.matched, 2);
         assert_eq!(summary.written, 0, "dry_run must not write");

@@ -500,6 +500,23 @@ impl Db {
         Ok(b)
     }
 
+    /// Find the first entry uname matching `(kind, first_line_cache == name)`.
+    /// Returns `Ok(None)` if no such row exists. Used by `--dedup-by-line`
+    /// import-fs path to skip lines already present in a named_index kind.
+    pub fn find_uname_by_first_line(&self, kind: &str, name: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uname FROM entries
+             WHERE kind = ?1 AND first_line_cache = ?2
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![kind, name])?;
+        if let Some(r) = rows.next()? {
+            Ok(Some(r.get(0)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn query_latest(&self, kind: &str, n: usize) -> Result<Vec<EntryMetaRow>> {
         let mut stmt = self.conn.prepare(
             // SELECT index: 0=id, 1=kind, 2=created_at, 3=updated_at, 4=current_version,

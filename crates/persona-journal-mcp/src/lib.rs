@@ -212,13 +212,17 @@ impl JournalService {
 
     /// Append a new entry. Returns `{ "id": "<kind>/<ym>_<seq:06>" }` (e.g. `"emo/2024-08_000012"`).
     /// Auto-registers the `emo` preset kind on first use if no kinds exist.
+    ///
+    /// Mode-aware: dispatches to entries or named_index writer based on the
+    /// registered kind's mode. `tags` are persisted for entries mode only
+    /// (named_index does not currently persist tags).
     #[tool(name = "journal_say", annotations(open_world_hint = false))]
     async fn say(&self, Parameters(p): Parameters<SayParams>) -> Result<String, String> {
         let j = self.journal(p.root);
         j.ensure_default_kinds(&p.persona)
             .map_err(|e| e.to_string())?;
         let id = j
-            .say(&p.persona, &p.kind, &p.text, p.tags)
+            .say_any(&p.persona, &p.kind, &p.text, p.tags)
             .map_err(|e| e.to_string())?;
         serde_json::to_string(&SayResult { id }).map_err(|e| e.to_string())
     }
